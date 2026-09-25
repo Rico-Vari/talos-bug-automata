@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1345,6 +1346,77 @@ def test_brief_names_the_repo_dir() -> None:
     check("review-fix: same", "Touch ONLY the sub-repo `automate-me`" in content)
 
 
+def test_run_watchdog() -> None:
+    """wait_for_run with real processes, and the threshold that comes from config.yaml."""
+    print("\nFrozen-run watchdog")
+    from talos import dispatch
+
+    with tempfile.TemporaryDirectory() as tmp, patched(dispatch, "STALL_POLL_SECONDS", 0.05):
+        log = Path(tmp) / "run.log"
+
+        def watch(script: str, stall: int, timeout: int = 30):
+            with open(log, "w") as f:
+                f.write("# Run\n")
+                f.flush()
+                proc = subprocess.Popen(["sh", "-c", script], stdout=f, stdin=subprocess.DEVNULL)
+                started = time.monotonic()
+                try:
+                    return dispatch.wait_for_run(proc, f, timeout, stall), time.monotonic() - started
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.wait()
+
+        cut, took = watch("echo x; sleep 30", stall=1)
+        check("a process that goes quiet is cut for stall", cut == "stall" and took < 5, f"{cut} {took:.1f}s")
+
+        cut, took = watch("for i in 1 2 3 4 5 6 7 8; do echo x; sleep 0.3; done", stall=1)
+        check("one that writes slower than the poll but faster than the threshold keeps going",
+              cut is None and took > 1.5, f"{cut} {took:.1f}s")
+
+        cut, _ = watch("sleep 30", stall=0, timeout=1)
+        check("with stall at 0, only the timeout cuts the silence", cut == "timeout", str(cut))
+
+        cut, _ = watch("echo x", stall=1)
+        check("a process that exits on its own is not cut", cut is None, str(cut))
+
+        with open(log, "w") as f:
+            proc = subprocess.Popen(["sh", "-c", "for i in 1 2 3 4 5 6; do echo x; sleep 0.3; done"],
+                                    stdout=f, stdin=subprocess.DEVNULL)
+            log.unlink()
+            try:
+                cut = dispatch.wait_for_run(proc, f, 30, 1)
+            finally:
+                proc.wait()
+        check("deleting the run log by hand does not kill a run that keeps writing", cut is None, str(cut))
+
+        class ExitedDuringCheck:
+            """The wait times out and the process exits before the cut is decided."""
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("docker", timeout)
+
+            def poll(self):
+                return 0
+
+        with open(log, "w") as f:
+            cut = dispatch.wait_for_run(ExitedDuringCheck(), f, 0, 0)
+        check("a run that exited right at the limit is not reported as a timeout", cut is None, str(cut))
+
+        cfg_path = Path(tmp) / "config.yaml"
+        for value, expected in (("-5", 1200), ("'20m'", 1200), ("true", 1200), ("0", 0), ("900", 900)):
+            cfg_path.write_text(f"vault: {tmp}\nstall_timeout_seconds: {value}\n")
+            with patched(dispatch, "CONFIG_PATH", cfg_path), captured_logs() as logs:
+                got = dispatch.load_config()["stall_timeout_seconds"]
+            check(f"stall_timeout_seconds: {value} → {expected}",
+                  got == expected and (expected != 1200 or any("stall_timeout_seconds" in m
+                                                               for m in _messages(logs, "WARNING"))),
+                  f"{got} {_messages(logs)}")
+        cfg_path.write_text(f"vault: {tmp}\n")
+        with patched(dispatch, "CONFIG_PATH", cfg_path):
+            check("without the key, the default is 20 min", dispatch.load_config()["stall_timeout_seconds"] == 1200)
+
+
 def test_agent_works_in_a_worktree() -> None:
     """Hardened runs get a worktree from origin/<base>; the main checkout is never touched."""
     print("\nPer-run worktree — the main checkout is not touched")
@@ -1579,11 +1651,21 @@ def test_agent_works_in_a_worktree() -> None:
         # commits in the worktree through its host path.
         cfg = {**sb.cfg(), "max_iterations": 1, "docker_image": "x"}
         docker_calls: list[list[str]] = []
+        proc_seen: dict = {}
 
         def fake_subprocess(behaviour: str):
             def fake_run(cmd, *a, **k):
-                if cmd and cmd[0] == "docker":
+                return real_run(cmd, *a, **k)
+
+            class FakeProc:
+                """`docker run` without docker. behaviour: ok, plant, crash, timeout
+                (writes and never exits), stall (neither writes nor exits), alive
+                (writes for a few rounds and exits 0)."""
+
+                def __init__(self, cmd, *a, stdout=None, **k):
+                    self.cmd, self.out, self.returncode, self.waits = cmd, stdout, None, 0
                     docker_calls.append(list(cmd))
+                    proc_seen["stdin"] = k.get("stdin")
                     mounts = [cmd[i + 1] for i, c in enumerate(cmd) if c == "-v"]
                     wt_mount = [m for m in mounts if m.endswith(":/workspace/sandbox")]
                     if wt_mount:
@@ -1591,21 +1673,43 @@ def test_agent_works_in_a_worktree() -> None:
                         real_run(["git", "-C", path, "checkout", "-q", "-B", "agent-branch"], check=True)
                         if behaviour == "plant":
                             real_run(["git", "-C", path, "config", "core.sshCommand", "touch /tmp/x"], check=True)
-                    if behaviour == "timeout":
-                        raise subprocess.TimeoutExpired(cmd, 1)
+
+                def poll(self):
+                    return self.returncode
+
+                def kill(self):
+                    proc_seen["killed"] = True
+                    self.returncode = -9
+
+                def wait(self, timeout=None):
+                    if self.returncode is not None:
+                        return self.returncode
                     if behaviour == "crash":
                         raise KeyboardInterrupt
-                    return subprocess.CompletedProcess(cmd, 0)
-                return real_run(cmd, *a, **k)
+                    if behaviour not in ("timeout", "stall", "alive"):
+                        self.returncode = 0
+                        return 0
+                    self.waits += 1
+                    if behaviour != "stall":
+                        self.out.write("{}\n")
+                        self.out.flush()
+                    if behaviour == "alive" and self.waits >= 150:
+                        self.returncode = 0
+                        return 0
+                    time.sleep(timeout)
+                    raise subprocess.TimeoutExpired(self.cmd, timeout)
 
             return type("FakeSubprocess", (), {
-                "run": staticmethod(fake_run), "TimeoutExpired": subprocess.TimeoutExpired,
+                "run": staticmethod(fake_run), "Popen": FakeProc,
+                "TimeoutExpired": subprocess.TimeoutExpired, "DEVNULL": subprocess.DEVNULL,
                 "STDOUT": subprocess.STDOUT, "CompletedProcess": subprocess.CompletedProcess,
             })
 
         def run_brief(pipeline: str, behaviour: str = "ok", project_path=None,
-                      subrepo="sandbox", **extra):
+                      subrepo="sandbox", cfg_over=None, **extra):
             docker_calls.clear()
+            proc_seen.clear()
+            run_brief.result = run_brief.error = None
             sb.docker.clear()
             meta = {"project": "sandbox", "subrepo": subrepo, "gh_repo": REPO,
                     "pr_number": 89, "base_branch": "developer", **extra}
@@ -1619,14 +1723,16 @@ def test_agent_works_in_a_worktree() -> None:
                 return {"status": "ok", "prs": []}
 
             with patched(dispatch, "subprocess", fake_subprocess(behaviour)), \
+                 patched(dispatch, "STALL_POLL_SECONDS", 0.01), \
                  patched(dispatch, "LOG_DIR", sb.root / "logs"), \
                  patched(dispatch, "get_gh_token", lambda: "x"), \
                  patched(dispatch, "prepare_agent_home",
                          lambda *a: (sb.root / "agent-home", [], {}, lambda: None)), \
                  patched(dispatch, "load_strict_result", strict):
                 try:
-                    dispatch.run_claude_in_docker("p", _brief(path), str(project_path or sb.project),
-                                                  str(sb.vault), cfg)
+                    run_brief.result = dispatch.run_claude_in_docker(
+                        "p", _brief(path), str(project_path or sb.project), str(sb.vault),
+                        {**cfg, **(cfg_over or {})})
                 except (RuntimeError, KeyboardInterrupt) as e:
                     run_brief.error = e
             runs = [c for c in docker_calls if c[1] == "run"]
@@ -1650,6 +1756,11 @@ def test_agent_works_in_a_worktree() -> None:
               > mounts(cmd).index(f"{git_dir}:{git_dir}"))
         check("and the container does the checkout before starting claude",
               cmd[-3:-1] == ["sh", "-c"] and cmd[-1].startswith('git -C "/workspace/$SUBREPO" reset --hard'))
+        check("claude runs with exec, without script(1)'s pty",
+              "&& exec claude -p " in cmd[-1] and "script -qfc" not in cmd[-1], cmd[-1][:120])
+        check("with --init: claude is PID 1 and something has to reap zombies", "--init" in cmd)
+        check("and the docker client does not inherit dispatch's stdin",
+              proc_seen.get("stdin") == subprocess.DEVNULL)
         check("and /workspace is the project folder", f"{sb.project}:/workspace" in mounts(cmd))
         check("when it ends the worktree is gone", list((sb.root / "worktrees").iterdir()) == [])
         check("the agent's branch stays in the repo", git("branch", "--list", "agent-branch") != "")
@@ -1661,14 +1772,44 @@ def test_agent_works_in_a_worktree() -> None:
         check("even if the run crashes after the container, the worktree is deleted",
               list((sb.root / "worktrees").iterdir()) == [])
 
-        run_brief("review-fix", "timeout")
+        with captured_logs(dispatch.logger) as logs:
+            run_brief("review-fix", "timeout", cfg_over={"timeouts": {"review-fix": 1},
+                                                         "stall_timeout_seconds": 1})
         check("on a timeout it kills the container by name before deleting the worktree",
               killed() == [True] and list((sb.root / "worktrees").iterdir()) == [], str(sb.docker))
+        check("a timeout is rc 124, kills the docker client and the log says timeout",
+              run_brief.result[0] == 124 and proc_seen.get("killed")
+              and any(m.startswith("Timeout (1s)") for m in _messages(logs, "ERROR")), str(_messages(logs)))
+
+        with captured_logs(dispatch.logger) as logs:
+            run_brief("review-fix", "stall", cfg_over={"stall_timeout_seconds": 1})
+        check("no new output within stall_timeout_seconds: cut like a timeout",
+              run_brief.result[0] == 124 and proc_seen.get("killed") and killed() == [True]
+              and list((sb.root / "worktrees").iterdir()) == [], str(sb.docker))
+        check("and the dispatch log says frozen, not timeout",
+              any("frozen" in m for m in _messages(logs, "ERROR"))
+              and not any(m.startswith("Timeout") for m in _messages(logs, "ERROR")), str(_messages(logs)))
+        check("and the run log ends with the reason for the cut, which is what Telegram shows",
+              run_brief.result[1].read_text().rstrip().endswith("# dispatch: run cut by stall (1s)"),
+              run_brief.result[1].read_text()[-200:])
+
+        run_brief("review-fix", "alive", cfg_over={"stall_timeout_seconds": 1})
+        check("a run that keeps writing stays alive past stall_timeout_seconds",
+              run_brief.result[0] == 0 and not proc_seen.get("killed") and killed() == [],
+              str((run_brief.result[0], sb.docker)))
+
+        with captured_logs(dispatch.logger) as logs:
+            run_brief("review-fix", "stall", cfg_over={"stall_timeout_seconds": 0,
+                                                       "timeouts": {"review-fix": 1}})
+        check("with stall_timeout_seconds at 0 only the pipeline timeout applies",
+              run_brief.result[0] == 124 and proc_seen.get("killed") and killed() == [True]
+              and any(m.startswith("Timeout (1s)") for m in _messages(logs, "ERROR"))
+              and not any("frozen" in m for m in _messages(logs)), str(_messages(logs)))
 
         run_brief("review-fix", "crash")
         check("with Ctrl-C halfway through the container, same: it kills it, then deletes the worktree",
               isinstance(getattr(run_brief, "error", None), KeyboardInterrupt)
-              and killed() == [True] and list((sb.root / "worktrees").iterdir()) == [], str(sb.docker))
+              and proc_seen.get("killed") and killed() == [True] and list((sb.root / "worktrees").iterdir()) == [], str(sb.docker))
 
         with captured_logs(dispatch.logger) as logs:
             run_brief("review-fix", "plant")
@@ -1685,7 +1826,7 @@ def test_agent_works_in_a_worktree() -> None:
         cmd = run_brief("", project_path=sb.project)
         check("a manual brief does not use a worktree (hardened pipelines only)",
               cmd is not None and not any("/worktrees/" in m for m in mounts(cmd))
-              and cmd[-4] == "script")
+              and cmd[-9:-7] == ["claude", "-p"] and "script" not in cmd, str(cmd and cmd[-9:]))
 
         cmd = run_brief("issue-fix", project_path=repo, subrepo="")
         env = [cmd[i + 1] for i, c in enumerate(cmd) if c == "-e"] if cmd else []
@@ -2398,6 +2539,7 @@ def main() -> int:
         test_review_fix_log_summary,
         test_brief_names_the_repo_dir,
         test_agent_works_in_a_worktree,
+        test_run_watchdog,
         test_merge_to_integration_parks_issue,
         test_merge_with_unknown_or_missing_branches,
         test_reconciler_closes_issue_row_after_round,

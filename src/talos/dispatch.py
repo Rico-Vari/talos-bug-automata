@@ -100,6 +100,9 @@ AGENT_HOMES_DIR = Path("~/.orchestrator/agent-home").expanduser()
 
 PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 MAX_INLINE_FILE_BYTES = 100 * 1024  # 100 KB
+# How often dispatch checks whether the run log grew. The silence threshold
+# is `stall_timeout_seconds` from the config.
+STALL_POLL_SECONDS = 30
 
 # Regex to detect absolute paths referenced in the brief body.
 # The `.` before the extension is escaped so it does not match any char.
@@ -123,6 +126,9 @@ telegram_chat_id: ""     # e.g. 987654321
 # Docker
 docker_image: claude-dev
 claude_timeout_seconds: 3600
+# No new output in the run log for this long and the run is considered
+# frozen and cut like a timeout. 0 turns it off.
+stall_timeout_seconds: 1200
 
 # Multi-agent swarm settings
 # How many fix-and-revalidate rounds (QA bugs + reviewer issues) the
@@ -199,6 +205,7 @@ def load_config() -> dict:
     cfg.setdefault("poll_interval_seconds", 300)
     cfg.setdefault("docker_image", "claude-dev")
     cfg.setdefault("claude_timeout_seconds", 3600)
+    cfg.setdefault("stall_timeout_seconds", 1200)
     cfg.setdefault("telegram_bot_token", "")
     cfg.setdefault("telegram_chat_id", "")
     cfg.setdefault("max_iterations", 3)
@@ -211,6 +218,14 @@ def load_config() -> dict:
     cfg.setdefault("timeouts", {})
     cfg.setdefault("global_daily_cap", 10)
     cfg.setdefault("reconcile_interval_minutes", 30)
+
+    stall = cfg["stall_timeout_seconds"]
+    if isinstance(stall, bool) or not isinstance(stall, int) or stall < 0:
+        # A negative value would cut every run after 30s, and a string would
+        # blow up halfway through run_claude_in_docker with the credentials
+        # already copied.
+        logger.warning("config.yaml: stall_timeout_seconds=%r is not an integer >= 0; using 1200", stall)
+        cfg["stall_timeout_seconds"] = 1200
 
     # A badly written routing config has to fail here, not six hours
     # later when the first webhook arrives.
@@ -500,8 +515,9 @@ def read_stream_result(run_log: Path) -> dict | None:
         last = None
         with open(run_log, errors="replace") as f:
             for line in f:
-                # The pty leaves stray \r and the order of the JSON keys is not
-                # guaranteed, so we have to parse it to know the type.
+                # Logs from when claude ran inside a pty carry stray \r, and
+                # the order of the JSON keys is not guaranteed, so we have to
+                # parse it to know the type.
                 line = line.strip().strip("\r")
                 if not line.startswith("{") or '"result"' not in line:
                     continue
@@ -715,6 +731,40 @@ def prepare_agent_home(config: dict, container_home: str, run_id: str):
     return home, mounts, env, finish
 
 
+def wait_for_run(proc, log_file, timeout_seconds: int, stall_seconds: int) -> str | None:
+    """Wait for the docker client. None if it exited on its own; "timeout" or "stall" if it must be cut.
+
+    Stall = the run log did not grow in `stall_seconds`. With stream-json a
+    live run writes at least one event per tool call, its own or its
+    subagents'; twenty minutes of nothing is a frozen run, and waiting
+    for the pipeline timeout wastes up to two hours and holds up the queue.
+    `stall_seconds` at 0 turns it off. It measures the open file, not the
+    path: deleting or moving the log by hand must not kill a healthy run.
+    """
+    start = last_growth = time.monotonic()
+    last_size = os.fstat(log_file.fileno()).st_size
+    while True:
+        try:
+            proc.wait(timeout=STALL_POLL_SECONDS)
+            return None
+        except subprocess.TimeoutExpired:
+            pass
+        now = time.monotonic()
+        size = os.fstat(log_file.fileno()).st_size
+        if size != last_size:
+            last_size, last_growth = size, now
+        if now - start >= timeout_seconds:
+            cut = "timeout"
+        elif stall_seconds and now - last_growth >= stall_seconds:
+            cut = "stall"
+        else:
+            continue
+        # It may have exited between the wait and here: a finished run is not cut.
+        if proc.poll() is not None:
+            return None
+        return cut
+
+
 def effective_returncode(returncode: int, stream: dict | None) -> int:
     """`claude -p` exits 0 even when the run crashed halfway (a burst of
     API 500s, for example). The only place that gets recorded is the
@@ -837,6 +887,9 @@ def run_claude_in_docker(
 
     cmd = [
         "docker", "run", "--rm",
+        # Sin pty, claude es el PID 1 del container: sin un init, los nietos
+        # que dejan los Bash del agente quedan zombies.
+        "--init",
         "--name", container_name,
         "--network=host",
         "--user", uid_gid,
@@ -910,37 +963,37 @@ def run_claude_in_docker(
         cmd += ["-e", key]
     cmd += ["-w", "/workspace", config["docker_image"]]
 
-    # `script -qfc` creates a pseudo-TTY that makes Node.js (and therefore
-    # the claude CLI) think it is interactive → line-buffered.
-    # stdbuf does not work because Node uses its own I/O layer, not libc stdio.
-    # `/dev/null` is script's "typescript file" — we do not need it
-    # because we already capture stdout in our run_log.
+    # claude writes straight into dispatch's pipe, with no pty. It used to be
+    # wrapped in `script -qfc` so Node would think it was in a terminal and
+    # not buffer; with stream-json that is no longer needed, because every
+    # event goes out on its own line as it happens. And the pty was costly:
+    # with stdin on /dev/null, `script` sometimes spins without draining the
+    # pty, claude blocks on write and the run freezes until the timeout.
     claude_args = [
         "claude", "-p", prompt,
         "--append-system-prompt-file", "/workspace/.lead-orchestrator.md",
         "--dangerously-skip-permissions",
-        # The pty alone is not enough: `claude -p` in text mode prints
-        # NOTHING until the final message, so a two-hour run that dies
-        # halfway leaves an empty log and zero evidence of how far it got.
-        # With stream-json every tool call lands in the log as it happens.
-        # Nobody parses this stdout (it is only archived), so the format
-        # change breaks nothing downstream.
+        # `claude -p` in text mode prints NOTHING until the final message, so
+        # a two-hour run that dies halfway leaves an empty log and zero
+        # evidence of how far it got. With stream-json every tool call lands
+        # in the log as it happens, and the stall watchdog has something to
+        # measure.
         "--output-format", "stream-json", "--verbose",
     ]
-    claude_cmd_str = " ".join(shlex.quote(a) for a in claude_args)
     if hardened:
         # The worktree was created with --no-checkout: the checkout runs here,
         # in the container, with whatever filters and LFS the repo has, not on the host.
-        cmd += ["sh", "-c", 'git -C "/workspace/$SUBREPO" reset --hard --quiet && exec script -qfc '
-                + shlex.quote(claude_cmd_str) + " /dev/null"]
+        cmd += ["sh", "-c", 'git -C "/workspace/$SUBREPO" reset --hard --quiet && exec '
+                + " ".join(shlex.quote(a) for a in claude_args)]
     else:
-        cmd += ["script", "-qfc", claude_cmd_str, "/dev/null"]
+        cmd += claude_args
 
     # issue-fix needs more than the default (plan + implementation + two
     # review passes); review-fix needs quite a bit less.
     timeout_seconds = int(
         (config.get("timeouts") or {}).get(pipeline, config["claude_timeout_seconds"])
     )
+    stall_seconds = config.get("stall_timeout_seconds", 0)
     logger.info(
         "docker run %s [pipeline=%s, timeout=%ss] (log: %s)",
         project_name, pipeline, timeout_seconds, run_log,
@@ -969,22 +1022,41 @@ def run_claude_in_docker(
         with open(run_log, "w") as f:
             f.write(f"# Run: {project_name} @ {datetime.now().isoformat()}\n\n")
             f.flush()
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env={**os.environ, **extra_env},
+            )
             try:
-                result = subprocess.run(
-                    cmd,
-                    stdout=f,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    timeout=timeout_seconds,
-                    env={**os.environ, **extra_env},
-                )
-                returncode = result.returncode
+                cut = wait_for_run(proc, f, timeout_seconds, stall_seconds)
+            finally:
+                # Timeout, stall, exception or Ctrl-C: the docker client dies
+                # here. The finally below kills the container.
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+            if cut is None:
+                returncode = proc.returncode
                 container_exited = True
-            except subprocess.TimeoutExpired:
-                logger.error(
-                    "Timeout (%ss) in %s [pipeline=%s]",
-                    timeout_seconds, project_name, pipeline,
-                )
+            else:
+                if cut == "stall":
+                    logger.error(
+                        "No output in the run log for %ss in %s [pipeline=%s]: "
+                        "run frozen, cutting it",
+                        stall_seconds, project_name, pipeline,
+                    )
+                else:
+                    logger.error(
+                        "Timeout (%ss) in %s [pipeline=%s]",
+                        timeout_seconds, project_name, pipeline,
+                    )
+                # Telegram shows the tail of the run log: make the reason visible there.
+                f.write(f"\n# dispatch: run cut by {cut} "
+                        f"({stall_seconds if cut == 'stall' else timeout_seconds}s)\n")
+                f.flush()
                 timed_out = True
                 returncode = 124
 

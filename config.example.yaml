@@ -22,6 +22,10 @@ telegram_chat_id: ""     # e.g. 987654321
 # Docker
 docker_image: claude-dev
 claude_timeout_seconds: 5400
+# Watchdog: if the run log does not grow for this long, the run is
+# considered frozen and cut like a timeout (rc 124, container killed),
+# without waiting for the pipeline timeout. 0 turns it off.
+stall_timeout_seconds: 1200
 
 # Multi-agent swarm settings
 # How many fix-and-revalidate rounds (QA bugs + reviewer issues) the

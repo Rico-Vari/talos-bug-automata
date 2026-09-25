@@ -104,7 +104,10 @@ claude -p <prompt> --append-system-prompt-file /workspace/.lead-orchestrator.md 
   --dangerously-skip-permissions --output-format stream-json --verbose
 ```
 
-This runs under `script -qfc` so there is a pseudo-TTY.
+The container runs with `--init` (claude is PID 1, so something has to reap
+the zombies left by the agent's Bash calls) and stdin on `/dev/null`. claude
+writes straight into dispatch's pipe; there is no pseudo-TTY. A stall watchdog
+cuts the run when the log stops growing for `stall_timeout_seconds`.
 
 ## State on disk
 
@@ -197,7 +200,7 @@ and the cost.
 | Sentry context fetched by dispatch | Fetched in the webhook handler | Two REST calls of up to 20 s don't fit in Sentry's ~1 s webhook timeout |
 | Per-run worktree created with `--no-checkout` on the host | Run in the user's checkout | Your working tree is never touched, and the host never runs checkout filters or LFS on a repo the container can write |
 | `stream-json` run logs | Text output | In text mode `claude -p` prints nothing until the end, so a run that dies after two hours left an empty log |
-| `script -qfc` wrapper | `stdbuf` | Node uses its own I/O layer. A pseudo-TTY is what makes the CLI line-buffered |
+| No pty, plus a stall watchdog | `script -qfc` wrapper | stream-json already emits one line per event. With stdin on `/dev/null`, `script` sometimes stopped draining the pty, claude blocked on write and the run froze until the pipeline timeout |
 | BMAD pinned to 6.10.0 | Latest BMAD | From 6.11 on, `bmad-quick-dev` is a shim that HALTs on the headless override. Migrating to `bmad-build-auto` is planned |
 | `--network=host` | The default bridge | Per-uid VPN routing traps the bridge, and the container already shared credentials and the vault, so network isolation was nominal for manual briefs |
 | Host credentials mounted read-write for manual briefs | Read-only | Claude Code writes `session-env/` on every start, and a read-only mount breaks the Bash tool |

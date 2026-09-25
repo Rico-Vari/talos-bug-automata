@@ -96,6 +96,7 @@ The main keys:
 | `telegram_bot_token`, `telegram_chat_id` | See [telegram.md](telegram.md) |
 | `docker_image` | Image to run (default `claude-dev`) |
 | `claude_timeout_seconds` | Timeout for a manual brief |
+| `stall_timeout_seconds` | Cut a run whose log has not grown for this long (default 1200, `0` disables) |
 | `max_iterations` | Fix-and-revalidate rounds the swarm architect may run before it aborts a manual brief |
 | `projects` | Allowlist of local project paths, `name: path` |
 | `repos`, `sentry`, `webhook`, `secrets`, `timeouts`, `global_daily_cap`, `reconcile_interval_minutes` | Event harness. See [event-harness.md](event-harness.md) |

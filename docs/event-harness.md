@@ -560,7 +560,10 @@ A slow run isn't necessarily stuck. The reviewers in `bmad-quick-dev` and
 `bmad-code-review` run as subagents and take up a good part of the run. In
 one early live run, the fix commit showed up at about 15 minutes and the rest
 was review. A run is stuck when the run log has no new events for several
-minutes, or when the pipeline's `timeouts:` value has passed.
+minutes, or when the pipeline's `timeouts:` value has passed. dispatch does not
+wait for the timeout: if the run log does not grow for `stall_timeout_seconds`
+(default 20 min), it cuts the run like a timeout (rc 124, container killed)
+and the dispatch log says "run frozen".
 
 The per-pipeline timeouts are set in `config.yaml`:
 
