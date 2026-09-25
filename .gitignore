@@ -1,0 +1,23 @@
+# Python
+venv
+venv/
+.venv/
+__pycache__/
+*.py[co]
+*.egg-info/
+build/
+dist/
+
+# Local configuration and secrets — never commit these
+config.yaml
+.env
+*.env
+secrets.env
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Misc
+*.log
+.DS_Store
+.codegraph/

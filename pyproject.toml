@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "talos-bug-automata"
+version = "0.1.0"
+description = "Self-hosted AI harness that turns GitHub issues and Sentry errors into reviewed pull requests, using Claude Code in hardened Docker containers."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Federico Valdez" }]
+keywords = ["claude-code", "ai-agents", "automation", "sentry", "github", "bmad", "telegram", "obsidian"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Bug Tracking",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "python-frontmatter>=1.1.0",
+    "PyYAML>=6.0",
+    "requests>=2.31",
+    "watchdog>=4.0",
+    "python-telegram-bot>=21.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Rico-Vari/talos-bug-automata"
+Issues = "https://github.com/Rico-Vari/talos-bug-automata/issues"
+
+[project.scripts]
+talos-dispatch = "talos.dispatch:main"
+talos-bot = "talos.bot:main"
+talos-webhookd = "talos.webhookd:main"
+talos-reconcile = "talos.reconcile:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+talos = ["prompts/*.md", "bmad-kit/**/*"]

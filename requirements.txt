@@ -1,0 +1,2 @@
+# Installs Talos and its dependencies (same as `pip install -e .`).
+-e .

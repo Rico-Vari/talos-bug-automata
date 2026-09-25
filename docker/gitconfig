@@ -1,0 +1,10 @@
+# Fallback identity only: at runtime dispatch bind-mounts the host's real
+# ~/.gitconfig over $HOME/.gitconfig, so your own name, email and credential
+# helper win. This file is used only when no host gitconfig is mounted.
+[user]
+    name = Talos Bot
+    email = talos-bot@users.noreply.github.com
+[safe]
+    directory = /workspace
+[init]
+    defaultBranch = main

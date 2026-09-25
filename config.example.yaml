@@ -1,0 +1,150 @@
+# talos-bug-automata — example configuration.
+#
+# Copy it to config.yaml at the repo root (or anywhere, and point the
+# TALOS_CONFIG env var at it) and adjust. `~` is expanded in `vault` and in
+# the `projects:` paths. Never commit config.yaml.
+
+# ── Briefs (Obsidian vault) ──────────────────────────────────────────────────
+vault: ~/Obsidian
+briefs_dir: ToDos              # brief inbox, relative to the vault
+memory_dir: agentes/memoria    # per-project agent memory, relative to the vault
+poll_interval_seconds: 300
+
+# Telegram bot — create it with @BotFather and get chat_id from /getUpdates
+telegram_bot_token: ""   # e.g. 123456:ABC-DEF...  (empty = no notifications)
+telegram_chat_id: ""     # e.g. 987654321
+
+# Auth: manual briefs mount the host's ~/.claude (run `claude` interactively
+# once on your machine to log in; the container inherits that session). The
+# harness pipelines (issue-fix, review-fix) do NOT: they use a throwaway
+# ~/.claude and authenticate with secrets.claude_oauth_token_env.
+
+# Docker
+docker_image: claude-dev
+claude_timeout_seconds: 5400
+
+# Multi-agent swarm settings
+# How many fix-and-revalidate rounds (QA bugs + reviewer issues) the
+# architect may run before aborting the brief and leaving the branch local,
+# unpushed. Iteration 0 = first pass. Raise it if the devs are slow to
+# converge; lower it if you want the system to escalate to a human sooner.
+max_iterations: 3
+
+# Local project folders: the allowlist of paths the agent may work in.
+# A project can be a single repo, or a parent folder holding several repos.
+projects:
+  acme: ~/code/Acme Main/      # umbrella folder with web-app/ and api/ inside
+  my-app: ~/code/my-app        # a project that is the repo itself
+
+# ── Event harness (Sentry + GitHub issues → PR + review + fixer) ─────────────
+# Registry of repos the harness listens to. `projects:` above is still the
+# allowlist of local paths; this maps owner/repo → that registry.
+#
+# activated_at is the backlog cutoff: only issues created AFTER it get in.
+# Without it, the reconciler would admit every open issue at once.
+#
+# base_branch is the development branch: each run works in its own worktree,
+# fetches inside it and starts from origin/<base_branch> (never the local
+# branch), and the PR targets it. It depends on the repo: developer, devel,
+# qa, or main if there is no integration branch.
+# subrepo: "" when the project in projects: is the repo itself.
+#
+# base_branch vs prod_branch: the automated PR is merged into base_branch and
+# the issue stays on standby (label ai-merged-dev) until the merge commit
+# reaches prod_branch. The reconciler closes it then.
+repos:
+  "acme-org/web-app":
+    project: acme
+    subrepo: web-app
+    base_branch: develop       # where the run starts from and where the PR goes
+    # prod_branch: main        # when the issue gets closed: on arriving here.
+                               # Defaults to the repo's default branch on GitHub
+    enabled: false
+    mode: dry_run              # dry_run | live
+    activated_at: "2026-01-01T00:00:00Z"
+    skip_label: ai-skip        # opt-out, not opt-in
+    authors_allow: []          # empty = any collaborator (private repo)
+    pr_label: ai-generated
+    cooldown_minutes: 60
+    max_open_auto_prs: 3
+    daily_cap: 3
+    max_review_fix_rounds: 3
+  "acme-org/api":
+    project: acme
+    subrepo: api
+    base_branch: devel
+    enabled: false
+    mode: dry_run
+    activated_at: "2026-01-01T00:00:00Z"
+    skip_label: ai-skip
+    authors_allow: []
+    pr_label: ai-generated
+    cooldown_minutes: 60
+    max_open_auto_prs: 3
+    daily_cap: 3
+    max_review_fix_rounds: 3
+
+# Only the `event_alert` resource is accepted: subscribe the Internal
+# Integration to "Alert Rule Action" and set the threshold on the Sentry alert
+# rule ("seen more than N times in M minutes", environment = production).
+# Sentry has the real count; `issue.created` arrives with count≈1 and is never
+# resent.
+#
+# `project_id`: the event_alert payload carries the project as a number. If
+# the slug is not in the payload, it is resolved through this id (Settings →
+# Projects → <project> → the number in the "Client Keys" URL).
+sentry:
+  org: acme
+  projects:
+    acme-web:
+      repo: "acme-org/web-app"
+      project_id: ""
+      service_path: ""         # folder inside the repo the errors come from ("" = repo root)
+      environments: [production]
+      min_level: error
+      title_denylist:          # regexes (case-insensitive) on the issue title; matches are rejected
+        - "ResizeObserver loop"
+        - "^ChunkLoadError"
+      enabled: false
+
+    # Example of a monorepo where several services report to the SAME Sentry
+    # project: the slug doesn't say which one failed — the `service` tag does,
+    # which each service emits with sentry_sdk.set_tag("service", ...). An
+    # event without the tag is rejected as `rejected_unknown_service` instead
+    # of guessing a service.
+    acme-api:
+      repo: "acme-org/api"
+      project_id: ""
+      service_map:             # tag value → service folder inside the repo
+        accounts: services/accounts
+        billing: services/billing
+        worker: services/worker
+      environments: [production]
+      min_level: error
+      enabled: false
+
+webhook:
+  bind: 127.0.0.1
+  port: 8787
+  public_host: ""          # informational, e.g. your-host.your-tailnet.ts.net
+
+# Env var NAMES, never values. The values live in
+# ~/.orchestrator/secrets.env (0600), loaded through systemd EnvironmentFile.
+secrets:
+  github_webhook_secret_env: GITHUB_WEBHOOK_SECRET
+  sentry_client_secret_env: SENTRY_CLIENT_SECRET
+  sentry_auth_token_env: SENTRY_AUTH_TOKEN
+  # Long-lived token from `claude setup-token`. The hardened containers use it
+  # instead of mounting the host's ~/.claude. Without it, they use a copy of
+  # ~/.claude/.credentials.json.
+  claude_oauth_token_env: CLAUDE_CODE_OAUTH_TOKEN
+
+# Per-pipeline timeout in seconds (falls back to claude_timeout_seconds).
+timeouts:
+  issue-fix: 7200
+  review-fix: 2700
+
+global_daily_cap: 10
+# How often dispatch asks GitHub for open issues the webhook didn't deliver
+# (tunnel down, retries exhausted). 0 disables the reconciler.
+reconcile_interval_minutes: 30

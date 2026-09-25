@@ -1,0 +1,22 @@
+# bmad-quick-dev overrides for the orchestrator's headless runs.
+#
+# Resolver merge rules: scalars override, arrays append.
+# That is why `on_complete` (a scalar) replaces the empty default, while
+# `activation_steps_prepend` and `persistent_facts` add to the base ones.
+#
+# Everything hangs off HEADLESS=1, so interactive sessions don't change
+# at all.
+
+[workflow]
+
+activation_steps_prepend = [
+  "If the environment variable HEADLESS is set to 1, read {project-root}/_bmad/custom/headless-contract.md in full and treat it as binding for the entire run, overriding any later instruction to greet, halt, ask, wait or offer. If HEADLESS is not 1, ignore this step entirely.",
+]
+
+persistent_facts = [
+  "When HEADLESS=1 there is no human in this session and nobody will answer a question. Any instruction to HALT, ask or wait resolves to the conservative default in _bmad/custom/headless-contract.md, recorded under '## Automated Decisions' in the spec file.",
+  "When HEADLESS=1 the route is always plan-code-review, never one-shot.",
+  "When HEADLESS=1 the 'NEVER auto-push' rule in step-05-present.md is overridden: the orchestrator system prompt at /workspace/.lead-orchestrator.md mandates the push and the PR, and names the branch, the base branch and the label.",
+]
+
+on_complete = "If HEADLESS=1, follow {project-root}/_bmad/custom/headless-complete.md. Otherwise do nothing."

@@ -1,0 +1,15 @@
+[Unit]
+Description=Run a talos dispatch pass every 2 minutes
+# The flock in dispatch.py makes overlapping passes safe: a second pass
+# returns 0 instead of racing. A timer (rather than --watch) also means a
+# crashed pass cannot wedge the loop, and `systemctl --user start
+# talos-dispatch.service` doubles as the manual kick.
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+Persistent=true
+Unit=talos-dispatch.service
+
+[Install]
+WantedBy=timers.target

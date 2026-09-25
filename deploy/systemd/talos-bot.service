@@ -1,0 +1,17 @@
+[Unit]
+Description=Talos Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=DOCKER_HOST=unix:///var/run/docker.sock
+WorkingDirectory=%h/talos-bug-automata
+ExecStart=%h/talos-bug-automata/venv/bin/talos-bot
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

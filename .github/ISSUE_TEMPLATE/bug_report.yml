@@ -1,0 +1,47 @@
+name: Bug report
+description: Something in Talos doesn't work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Remove tokens, webhook secrets and private repo
+        names** from anything you paste. Security problems go through
+        [private reporting](../security/advisories/new), not here.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - dispatch (briefs, Docker runs)
+        - webhookd (GitHub / Sentry ingress)
+        - reconciler
+        - Telegram bot
+        - BMAD kit / agent prompts
+        - docs
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant lines from `~/.orchestrator/logs/`, `journalctl --user -u talos-*`, or `python scripts/events.py --show <id>`.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse --short HEAD`
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, Python version, Docker version, Claude Code version.

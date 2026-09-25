@@ -1,0 +1,13 @@
+[Unit]
+Description=Talos dispatch pass (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=DOCKER_HOST=unix:///var/run/docker.sock
+EnvironmentFile=-%h/.orchestrator/secrets.env
+WorkingDirectory=%h/talos-bug-automata
+ExecStart=%h/talos-bug-automata/venv/bin/talos-dispatch --once
+StandardOutput=journal
+StandardError=journal

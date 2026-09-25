@@ -1,0 +1,17 @@
+[Unit]
+Description=Talos webhook ingress (GitHub + Sentry)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.orchestrator/secrets.env
+WorkingDirectory=%h/talos-bug-automata
+ExecStart=%h/talos-bug-automata/venv/bin/talos-webhookd
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

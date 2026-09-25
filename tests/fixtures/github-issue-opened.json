@@ -1,0 +1,25 @@
+{
+  "action": "opened",
+  "issue": {
+    "number": 4242,
+    "title": "The date picker ignores the user's time zone",
+    "body": "Booking a session from Mexico stores the time in UTC and shows it 6h ahead.\n\nSteps: 1) open /agenda 2) pick 10:00 3) save 4) reload.",
+    "html_url": "https://github.com/acme-org/web-app/issues/4242",
+    "state": "open",
+    "created_at": "2099-01-01T12:00:00Z",
+    "labels": [],
+    "user": {
+      "login": "octo-contributor",
+      "type": "User"
+    },
+    "author_association": "COLLABORATOR"
+  },
+  "repository": {
+    "full_name": "acme-org/web-app",
+    "private": true
+  },
+  "sender": {
+    "login": "octo-contributor",
+    "type": "User"
+  }
+}
