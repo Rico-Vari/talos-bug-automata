@@ -2103,7 +2103,7 @@ def run_reconciler(config: dict) -> None:
         # not get it as a parameter. The reconciler goes through the same
         # door, so it has to be populated with this pass's config.
         webhookd.CFG = config
-        store_mod = __import__("store")
+        from talos import store as store_mod
         store_mod.init_db()
         results = reconcile.reconcile(config)
         reconcile.touch_stamp()

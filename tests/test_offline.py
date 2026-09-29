@@ -178,6 +178,28 @@ def _brief(path: Path):
 # ── Critical ─────────────────────────────────────────────────────────────────
 
 
+def test_imports_go_through_the_package() -> None:
+    """Every internal import names the talos package, dynamic ones included."""
+    print("\nImports go through the talos package")
+    import ast
+
+    internal = {p.stem for p in (ROOT / "src" / "talos").glob("*.py")} - {"__init__"}
+    bad = []
+    for path in sorted((ROOT / "src" / "talos").glob("*.py")) + sorted((ROOT / "scripts").glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module.split(".")[0]]
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                  and node.func.id == "__import__" and node.args
+                  and isinstance(node.args[0], ast.Constant)):
+                names = [str(node.args[0].value).split(".")[0]]
+            bad += [f"{path.name}:{node.lineno} {n}" for n in names if n in internal]
+    check("no module imports a sibling without the talos. prefix", bad == [], ", ".join(bad))
+
+
 def test_issue_body_cannot_inline_host_files() -> None:
     """C1: an issue body cannot paste host files into the prompt."""
     print("\nC1 — file inlining only for manual briefs")
@@ -2505,6 +2527,7 @@ def test_ensure_labels_once_per_repo() -> None:
 def main() -> int:
     print("Offline harness tests")
     for fn in (
+        test_imports_go_through_the_package,
         test_issue_body_cannot_inline_host_files,
         test_git_auth_never_touches_disk,
         test_dispatch_caps,
