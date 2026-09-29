@@ -837,6 +837,41 @@ def test_revalidate_before_dispatch() -> None:
         check("if gh fails, it defers (None) instead of running", w is None)
 
 
+def test_telegram_token_is_a_secret() -> None:
+    """#2: the Telegram token comes from secrets.env; a literal still works, with a warning."""
+    print("\nTelegram token from secrets.env")
+    from talos import secrets_env
+
+    cfg = {"secrets": {"telegram_bot_token_env": "TALOS_TEST_TG"}, "telegram_bot_token": "123:S3CR3T"}
+    os.environ["TALOS_TEST_TG"] = "from-env"
+    try:
+        check("the env var wins over the literal", secrets_env.telegram_token(cfg) == "from-env")
+    finally:
+        del os.environ["TALOS_TEST_TG"]
+    with patched(secrets_env, "_warned_literal_telegram", False), \
+         captured_logs(secrets_env.logger) as logs:
+        first = secrets_env.telegram_token(cfg)
+        secrets_env.telegram_token(cfg)
+    warnings = _messages(logs, "WARNING")
+    check("without the env var, the literal still works, warned once and without the value",
+          first == "123:S3CR3T" and len(warnings) == 1 and "S3CR3T" not in warnings[0], str(warnings))
+    check("nothing configured: empty", secrets_env.telegram_token({}) == "")
+    os.environ["TELEGRAM_BOT_TOKEN"], saved = "default-name", os.environ.get("TELEGRAM_BOT_TOKEN")
+    try:
+        check("without the key, TELEGRAM_BOT_TOKEN is the default name",
+              secrets_env.telegram_token({}) == "default-name")
+    finally:
+        os.environ.pop("TELEGRAM_BOT_TOKEN")
+        if saved is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = saved
+    with patched(secrets_env, "_warned_literal_telegram", False), \
+         captured_logs(secrets_env.logger) as logs:
+        token = secrets_env.telegram_token({"secrets": {"telegram_bot_token_env": "TALOS_TEST_TG"}})
+    check("key set but the variable missing: says which variable, instead of going silent",
+          token == "" and any("TALOS_TEST_TG" in m for m in _messages(logs, "WARNING")),
+          str(_messages(logs)))
+
+
 def test_telegram_html() -> None:
     """P18: variable text is HTML-escaped, not legacy Markdown."""
     print("\nP18 — Telegram in HTML")
@@ -1725,7 +1760,10 @@ def test_agent_works_in_a_worktree() -> None:
                 def __init__(self, cmd, *a, stdout=None, **k):
                     self.cmd, self.out, self.returncode, self.waits = cmd, stdout, None, 0
                     docker_calls.append(list(cmd))
-                    proc_seen["stdin"] = k.get("stdin")
+                    stdin = k.get("stdin")
+                    proc_seen["stdin"] = stdin
+                    proc_seen["stdin_text"] = stdin.read() if hasattr(stdin, "read") else None
+                    proc_seen["env"] = k.get("env")
                     mounts = [cmd[i + 1] for i, c in enumerate(cmd) if c == "-v"]
                     wt_mount = [m for m in mounts if m.endswith(":/workspace/sandbox")]
                     if wt_mount:
@@ -1733,6 +1771,18 @@ def test_agent_works_in_a_worktree() -> None:
                         real_run(["git", "-C", path, "checkout", "-q", "-B", "agent-branch"], check=True)
                         if behaviour == "plant":
                             real_run(["git", "-C", path, "config", "core.sshCommand", "touch /tmp/x"], check=True)
+                        if behaviour == "init":
+                            ws = [m for m in mounts if m.endswith(":/workspace")][0].rsplit(":", 1)[0]
+                            (Path(ws) / "docs" / ".git").mkdir()
+                        if behaviour == "swap":
+                            # The agent writes a token into the shared config and swaps a
+                            # dotfile for a directory, so deleting it raises.
+                            real_run(["git", "-C", path, "config", "remote.fork.url",
+                                      "https://x-access-token:ghs_swap@github.com/o/r.git"], check=True)
+                            ws = [m for m in mounts if m.endswith(":/workspace")][0].rsplit(":", 1)[0]
+                            lead = Path(ws) / ".lead-orchestrator.md"
+                            lead.unlink()
+                            (lead / "x").mkdir(parents=True)
 
                 def poll(self):
                     return self.returncode
@@ -1765,9 +1815,13 @@ def test_agent_works_in_a_worktree() -> None:
                 "STDOUT": subprocess.STDOUT, "CompletedProcess": subprocess.CompletedProcess,
             })
 
+        finished: list[int] = []
+
         def run_brief(pipeline: str, behaviour: str = "ok", project_path=None,
-                      subrepo="sandbox", cfg_over=None, **extra):
+                      subrepo="sandbox", cfg_over=None, prompt="p", **extra):
             docker_calls.clear()
+            finished.clear()
+            (sb.root / "agent-home").mkdir(exist_ok=True)
             proc_seen.clear()
             run_brief.result = run_brief.error = None
             sb.docker.clear()
@@ -1787,11 +1841,11 @@ def test_agent_works_in_a_worktree() -> None:
                  patched(dispatch, "LOG_DIR", sb.root / "logs"), \
                  patched(dispatch, "get_gh_token", lambda: "x"), \
                  patched(dispatch, "prepare_agent_home",
-                         lambda *a: (sb.root / "agent-home", [], {}, lambda: None)), \
+                         lambda *a: (sb.root / "agent-home", [], {}, lambda: finished.append(1))), \
                  patched(dispatch, "load_strict_result", strict):
                 try:
                     run_brief.result = dispatch.run_claude_in_docker(
-                        "p", _brief(path), str(project_path or sb.project), str(sb.vault),
+                        prompt, _brief(path), str(project_path or sb.project), str(sb.vault),
                         {**cfg, **(cfg_over or {})})
                 except (RuntimeError, KeyboardInterrupt) as e:
                     run_brief.error = e
@@ -1819,14 +1873,129 @@ def test_agent_works_in_a_worktree() -> None:
         check("claude runs with exec, without script(1)'s pty",
               "&& exec claude -p " in cmd[-1] and "script -qfc" not in cmd[-1], cmd[-1][:120])
         check("with --init: claude is PID 1 and something has to reap zombies", "--init" in cmd)
-        check("and the docker client does not inherit dispatch's stdin",
-              proc_seen.get("stdin") == subprocess.DEVNULL)
+        check("the prompt goes in on stdin (docker run -i), not in argv",
+              "-i" in cmd and proc_seen.get("stdin_text") == "p"
+              and proc_seen.get("stdin") is not subprocess.DEVNULL
+              and cmd[-1].endswith("--verbose") and " -p --append-system-prompt-file " in cmd[-1],
+              str((proc_seen.get("stdin_text"), cmd[-1][-200:])))
+        check("and the prompt file is gone once the run ends",
+              proc_seen["stdin"].closed)
+        env = [cmd[i + 1] for i, c in enumerate(cmd) if c == "-e"]
+        check("GH_TOKEN goes by name only: the value is in the docker client's env, not in argv",
+              "GH_TOKEN" in env and not any(e.startswith("GH_TOKEN=") for e in env)
+              and (proc_seen.get("env") or {}).get("GH_TOKEN") == "x", str(env))
         check("and /workspace is the project folder", f"{sb.project}:/workspace" in mounts(cmd))
         check("when it ends the worktree is gone", list((sb.root / "worktrees").iterdir()) == [])
         check("the agent's branch stays in the repo", git("branch", "--list", "agent-branch") != "")
         check("and the main checkout stays on its branch",
               git("symbolic-ref", "--short", "HEAD") == "my-work")
         check("a container that exited on its own is not killed", killed() == [], str(sb.docker))
+        check("and the throwaway home is written back and deleted",
+              finished == [1] and not (sb.root / "agent-home").exists())
+
+        big = "x" * (300 * 1024)
+        cmd = run_brief("review-fix", prompt=big)
+        check("a 300 KB prompt: argv stays small, the whole prompt reaches stdin",
+              cmd is not None and max(len(a) for a in cmd) < 4096
+              and proc_seen.get("stdin_text") == big, str(cmd and max(len(a) for a in cmd)))
+
+        lead = sb.project / ".lead-orchestrator.md"
+        run_brief("review-fix", "swap")
+        check("a dotfile swapped for a directory is deleted, so it cannot block the next run",
+              "ghs_swap" not in (git_dir / "config").read_text()
+              and not lead.exists() and run_brief.error is None, str(run_brief.error))
+        git("config", "--unset", "remote.fork.url")
+
+        def boom(*a, **k):
+            raise OSError("boom")
+
+        (sb.project / ".orchestrator-plan.md").mkdir()  # a leftover the next run clears
+        with captured_logs(dispatch.logger) as logs, \
+             patched(dispatch, "guard_git_remote", boom), \
+             patched(worktree, "remove", boom):
+            run_brief("review-fix")
+        check("a cleanup step that raises does not skip the rest",
+              finished == [1] and not (sb.root / "agent-home").exists() and not lead.exists()
+              and not (sb.project / ".orchestrator-plan.md").exists()
+              and run_brief.error is None, str((finished, run_brief.error)))
+        check("and each failure is logged, naming the step",
+              any("could not restore the git remote: boom" in m for m in _messages(logs, "ERROR"))
+              and any("could not remove the worktree: boom" in m for m in _messages(logs, "ERROR")),
+              str(_messages(logs, "ERROR")))
+        for leftover in (sb.root / "worktrees").iterdir():
+            shutil.rmtree(leftover)
+        git("worktree", "prune")
+
+        def interrupt(*a, **k):
+            raise KeyboardInterrupt
+
+        with captured_logs(dispatch.logger) as logs, patched(dispatch, "guard_git_remote", interrupt):
+            run_brief("review-fix")
+        check("a Ctrl-C in the middle of the cleanup: the rest still runs, then it is raised",
+              isinstance(run_brief.error, KeyboardInterrupt) and finished == [1]
+              and not (sb.root / "agent-home").exists()
+              and list((sb.root / "worktrees").iterdir()) == [] and not lead.exists(),
+              str((run_brief.error, finished)))
+
+        real_remove = dispatch._remove_path
+
+        def stuck_home(path):
+            if path == sb.root / "agent-home":
+                raise OSError(f"{path} is still there")
+            real_remove(path)
+
+        with captured_logs(dispatch.logger) as logs, patched(dispatch, "_remove_path", stuck_home):
+            run_brief("review-fix")
+        check("a home that cannot be deleted is reported, not silently left behind",
+              any("could not delete the agent home" in m for m in _messages(logs, "ERROR")),
+              str(_messages(logs, "ERROR")))
+        for leftover in (lead, sb.root / "agent-home"):
+            if leftover.exists():
+                shutil.rmtree(leftover) if leftover.is_dir() else leftover.unlink()
+
+        # Umbrella project: siblings and the umbrella's .git go read-only on top.
+        (sb.project / "other" / ".git").mkdir(parents=True)
+        (sb.project / ".git").mkdir()
+        (sb.project / "docs").mkdir()
+        (sb.project / "linked").symlink_to(sb.project / "other")
+        cmd = run_brief("review-fix")
+        ro = [m for m in mounts(cmd) if m.endswith(":ro")]
+        check("umbrella: sibling repos and the umbrella's .git are mounted read-only",
+              f"{sb.project / 'other'}:/workspace/other:ro" in ro
+              and f"{sb.project / '.git'}:/workspace/.git:ro" in ro, str(ro))
+        check("but not the run's sub-repo, plain folders or symlinks",
+              not any(m.endswith((":/workspace/sandbox:ro", ":/workspace/docs:ro", ":/workspace/linked:ro"))
+                      for m in ro), str(ro))
+        cmd = run_brief("", project_path=sb.project)
+        check("a manual brief keeps the project read-write as before",
+              not any(m.startswith(str(sb.project / "other")) for m in mounts(cmd)), str(mounts(cmd)))
+        with captured_logs(dispatch.logger) as logs:
+            run_brief("review-fix", "init")
+        check("a repo the run creates in the umbrella is reported when it ends",
+              any("created a git repo at" in m and "docs" in m for m in _messages(logs, "ERROR")),
+              str(_messages(logs, "ERROR")))
+        (sb.project / "linked").unlink()
+        shutil.rmtree(sb.project / "other")
+        shutil.rmtree(sb.project / ".git")
+        shutil.rmtree(sb.project / "docs")
+
+        # readonly_siblings on its own: nested sub-repos, bare mirrors, unreadable children.
+        tree = sb.root / "tree"
+        for d in ("apps/api/.git", "apps/web/.git", "apps/.git", "infra.git/objects",
+                  "plain/deep/.git", "locked"):
+            (tree / d).mkdir(parents=True)
+        (tree / "infra.git" / "HEAD").write_text("ref: refs/heads/main\n")
+        (tree / "locked" / "x").mkdir()
+        (tree / "locked").chmod(0)
+        try:
+            got = {str(x.relative_to(tree)) for x in worktree.readonly_siblings(tree, "apps/api")}
+        finally:
+            (tree / "locked").chmod(0o700)
+        check("nested sub-repo: covers the siblings and .git at every level, bare mirrors too",
+              got == {"apps/.git", "apps/web", "infra.git"}, str(sorted(got)))
+        check("subrepo '.', '..' or empty: nothing to cover, no crash",
+              worktree.readonly_siblings(tree, ".") == [] and worktree.readonly_siblings(tree, "") == []
+              and worktree.readonly_siblings(tree, "../x") == [])
 
         run_brief("review-fix", "raise")
         check("even if the run crashes after the container, the worktree is deleted",
@@ -1886,7 +2055,7 @@ def test_agent_works_in_a_worktree() -> None:
         cmd = run_brief("", project_path=sb.project)
         check("a manual brief does not use a worktree (hardened pipelines only)",
               cmd is not None and not any("/worktrees/" in m for m in mounts(cmd))
-              and cmd[-9:-7] == ["claude", "-p"] and "script" not in cmd, str(cmd and cmd[-9:]))
+              and cmd[-8:-6] == ["claude", "-p"] and "script" not in cmd, str(cmd and cmd[-8:]))
 
         cmd = run_brief("issue-fix", project_path=repo, subrepo="")
         env = [cmd[i + 1] for i, c in enumerate(cmd) if c == "-e"] if cmd else []
@@ -2583,6 +2752,7 @@ def main() -> int:
         test_brief_write_failure_is_retryable,
         test_negative_content_length,
         test_revalidate_before_dispatch,
+        test_telegram_token_is_a_secret,
         test_telegram_html,
         test_oldest_brief_first,
         test_backfill_counts_admitted,

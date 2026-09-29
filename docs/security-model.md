@@ -114,6 +114,18 @@ sees less than a manual brief's.
     hook can't run the next time you use git by hand. If the run leaves a key
     outside the allowlist (below) in the config, dispatch reports an error
     when the run ends and the next run refuses to start.
+  - **Sibling sub-repos are read-only.** In an umbrella project `/workspace`
+    is the project folder, read-write, and the worktree covers only the run's
+    sub-repo. Every other git repo on the way to it (the siblings at each
+    level of the sub-repo's path, bare mirrors included, and each level's own
+    `.git`) is mounted read-only on top. The agent can read them as context,
+    but it can't plant a hook, move a `HEAD` or write config in an existing
+    repo the run doesn't touch.
+  - Not covered: symlinked children, repos nested below a plain folder, and
+    paths with a `:` (logged). The rest of the umbrella stays writable, so
+    the agent could `git init` a new repo there. Dispatch reports any repo
+    that appeared during the run as an error: inspect or delete it before
+    you run git in it.
   - **The run's branch can't be checked out in your checkout.** That's the
     brief's branch for `issue-fix` and the PR head for `review-fix`. If it is
     checked out, the run fails with that reason before the container starts.
@@ -213,6 +225,7 @@ GITHUB_WEBHOOK_SECRET=...     # you generate it (e.g. openssl rand -hex 32); scr
 SENTRY_CLIENT_SECRET=...      # issued by Sentry when you create the Internal Integration
 SENTRY_AUTH_TOKEN=...         # same
 CLAUDE_CODE_OAUTH_TOKEN=...   # `claude setup-token`, for hardened containers
+TELEGRAM_BOT_TOKEN=...        # from @BotFather, optional
 ```
 
 `config.yaml` maps each one by name:
@@ -223,10 +236,17 @@ secrets:
   sentry_client_secret_env: SENTRY_CLIENT_SECRET
   sentry_auth_token_env: SENTRY_AUTH_TOKEN
   claude_oauth_token_env: CLAUDE_CODE_OAUTH_TOKEN
+  telegram_bot_token_env: TELEGRAM_BOT_TOKEN
 ```
 
-Dispatch passes secrets to `docker run` by name only (`-e NAME`), so the
-values never show up in `ps`.
+Dispatch passes secrets to `docker run` by name only (`-e NAME`), including
+the `GH_TOKEN` it reads from `gh auth token`, so the values never show up in
+`ps` or `/proc/<pid>/cmdline`. The prompt goes in on stdin, not in argv.
+
+When a run ends, each cleanup step (kill the container, restore the git
+remote and scrub tokens from `.git/config`, delete the throwaway home,
+remove the worktree, delete the dotfiles) runs on its own. One that fails is
+logged and doesn't skip the rest, and the security steps run first.
 
 ## Known gaps and accepted risks
 
