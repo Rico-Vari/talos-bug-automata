@@ -215,16 +215,25 @@ def gate_self_review(body: str | None) -> Verdict:
     return OK
 
 
-def gate_association(issue: dict) -> Verdict:
-    """Reject authors with no relationship to the repo.
+# Who may feed a prompt: people with write access to the repo. Everything else
+# (CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, NONE, MANNEQUIN) is a
+# stranger on a public repo: opening a PR, even one that is never merged, is
+# enough to stop being NONE.
+TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
-    On private repos this never fires, but if one goes
-    public it is the only thing standing between a stranger and a container with
-    broad permissions.
+
+def gate_association(item: dict) -> Verdict:
+    """Only authors with write access to the repo get in.
+
+    `item` is an issue, a review or a review comment: all three carry
+    `author_association`. On a private repo only collaborators can write, so
+    this never fires; on a public one it is the only thing standing between a
+    stranger and a container with broad permissions. A missing value is
+    rejected: failing closed beats guessing.
     """
-    assoc = (issue.get("author_association") or "").upper()
-    if assoc in {"NONE", "MANNEQUIN"}:
-        return _reject("author_association", f"author_association={assoc}")
+    assoc = (item.get("author_association") or "").upper()
+    if assoc not in TRUSTED_ASSOCIATIONS:
+        return _reject("author_association", f"author_association={assoc or 'missing'}")
     return OK
 
 

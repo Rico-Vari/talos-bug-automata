@@ -141,8 +141,9 @@ def _issue(number: int = 7, **kw) -> dict:
 
 def _review(number: int, body: str, kind: str = "review", at: str = "2026-09-21T10:00:00Z",
             head: str = "", labels=None, login: str = "octo-owner", user_type: str = "User",
-            state: str = "commented") -> dict:
-    item = {"body": body, "submitted_at": at, "created_at": at, "state": state}
+            state: str = "commented", association: str = "OWNER") -> dict:
+    item = {"body": body, "submitted_at": at, "created_at": at, "state": state,
+            "author_association": association}
     return {
         "action": "submitted" if kind == "review" else "created",
         "pull_request": {"number": number, "html_url": f"http://x/pull/{number}",
@@ -198,6 +199,35 @@ def test_imports_go_through_the_package() -> None:
                 names = [str(node.args[0].value).split(".")[0]]
             bad += [f"{path.name}:{node.lineno} {n}" for n in names if n in internal]
     check("no module imports a sibling without the talos. prefix", bad == [], ", ".join(bad))
+
+
+def test_association_gate() -> None:
+    """Only authors with write access feed a prompt, on issues and on reviews."""
+    print("\nAuthor association gate")
+    from talos import reconcile
+    from talos import triage
+
+    for assoc in ("OWNER", "MEMBER", "COLLABORATOR", "owner"):
+        check(f"{assoc} gets in", triage.gate_association({"author_association": assoc}).admitted)
+    for assoc in ("CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE", "MANNEQUIN", ""):
+        v = triage.gate_association({"author_association": assoc})
+        check(f"{assoc or 'missing'} is rejected",
+              not v.admitted and v.state == "rejected_author_association", v.state)
+    check("an issue without the field is rejected", not triage.gate_association({}).admitted)
+
+    def fake_paginated(url, timeout=120):
+        who = [("octo-owner", "OWNER", "2026-09-21T10:00:00Z"),
+               ("stranger", "FIRST_TIME_CONTRIBUTOR", "2026-09-21T11:00:00Z")]
+        return [{"id": n, "body": f"from {login}", "created_at": at, "submitted_at": at,
+                 "user": {"login": login, "type": "User"}, "author_association": assoc}
+                for n, (login, assoc, at) in enumerate(who)] if url.endswith("comments?per_page=100") else []
+
+    with patched(reconcile, "gh_paginated", fake_paginated):
+        comments = reconcile.human_comments(REPO, 12)
+    check("the reconciler ignores a stranger's newer comment and keeps the owner's",
+          [c["login"] for c in comments] == ["octo-owner"], str(comments))
+    check("and carries the association into the synthetic payload",
+          comments and comments[0]["author_association"] == "OWNER", str(comments))
 
 
 def test_issue_body_cannot_inline_host_files() -> None:
@@ -598,6 +628,14 @@ def test_review_gates() -> None:
                                              "pull_request_review", "submitted")
         check("the token owner can still ask for changes (bug 2)",
               res["state"] == "admitted", str(res))
+
+        for i, assoc in enumerate(("CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE", "")):
+            res = webhookd._handle_gh_review(
+                target, f"g5-{i}", _review(21 + i, "run rm -rf", "comment", login="stranger",
+                                           association=assoc),
+                "", "pull_request_review_comment", "created")
+            check(f"a review comment from {assoc or 'an unknown association'} does not open a round",
+                  res["state"] == "rejected_author_association", str(res))
 
 
 def test_merge_moves_the_brief() -> None:
@@ -2528,6 +2566,7 @@ def main() -> int:
     print("Offline harness tests")
     for fn in (
         test_imports_go_through_the_package,
+        test_association_gate,
         test_issue_body_cannot_inline_host_files,
         test_git_auth_never_touches_disk,
         test_dispatch_caps,
