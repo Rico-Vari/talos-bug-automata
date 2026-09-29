@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=DOCKER_HOST=unix:///var/run/docker.sock
+EnvironmentFile=-%h/.orchestrator/secrets.env
 WorkingDirectory=%h/talos-bug-automata
 ExecStart=%h/talos-bug-automata/venv/bin/talos-bot
 Restart=on-failure

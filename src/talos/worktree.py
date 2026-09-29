@@ -143,6 +143,47 @@ def workspace_dir(project: str, project_path: str | Path, subrepo: str) -> Path:
     return Path(project_path) if subrepo else WORKSPACES_DIR / project
 
 
+def _is_repo(path: Path) -> bool:
+    """A checkout (has `.git`) or a bare repo / mirror (HEAD + objects/)."""
+    return (path / ".git").exists() or ((path / "HEAD").is_file() and (path / "objects").is_dir())
+
+
+def readonly_siblings(project_path: str | Path, subrepo: str) -> list[Path]:
+    """What of an umbrella project the container must see read-only.
+
+    With a sub-repo, /workspace is the project folder mounted read-write, and
+    the worktree covers only `/workspace/$SUBREPO`. Every other git repo on
+    the way to it — the siblings at each level of the sub-repo's path, bare
+    mirrors included, and each level's own `.git` — goes on top read-only.
+    Symlinks are skipped: docker would follow them on the host. So is a child
+    this user cannot read: the container runs as the same uid and cannot
+    write it either. Without a sub-repo, /workspace is a harness folder and
+    there is nothing to cover.
+    """
+    parts = [p for p in Path(subrepo or ".").parts if p != "."]
+    if not parts or ".." in parts:
+        return []
+    found: list[Path] = []
+    level = Path(project_path)
+    for part in parts:
+        try:
+            children = sorted(level.iterdir())
+        except OSError:
+            break
+        for child in children:
+            if child.name == part:
+                continue
+            try:
+                if child.is_symlink():
+                    continue
+                if child.name == ".git" or (child.is_dir() and _is_repo(child)):
+                    found.append(child)
+            except OSError:
+                continue
+        level = level / part
+    return found
+
+
 def container_subrepo(project_path: str | Path, subrepo: str) -> str:
     """The repo's name inside /workspace ($SUBREPO in the container)."""
     return subrepo or Path(project_path).resolve().name

@@ -20,6 +20,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -114,9 +115,11 @@ briefs_dir: ToDos
 memory_dir: agentes/memoria
 poll_interval_seconds: 300
 
-# Telegram bot — create it with @BotFather and get chat_id from /getUpdates
-telegram_bot_token: ""   # e.g. 123456:ABC-DEF...
+# Telegram bot — create it with @BotFather and get chat_id from /getUpdates.
+# The token goes in ~/.orchestrator/secrets.env as TELEGRAM_BOT_TOKEN.
 telegram_chat_id: ""     # e.g. 987654321
+secrets:
+  telegram_bot_token_env: TELEGRAM_BOT_TOKEN
 
 # Auth: manual briefs mount the host's ~/.claude read-write (run `claude`
 # interactively once on your machine to log in; the container inherits that
@@ -180,7 +183,7 @@ def load_config() -> dict:
         print(
             f"Config created at {CONFIG_PATH}.\n"
             "Edit these fields:\n"
-            "  - telegram_bot_token + telegram_chat_id (optional)\n"
+            "  - telegram_chat_id, and TELEGRAM_BOT_TOKEN in ~/.orchestrator/secrets.env (optional)\n"
             "Make sure ~/.claude exists on your host (run `claude` interactively\n"
             "once to log in if it does not).\n"
             "Then run:\n"
@@ -857,13 +860,13 @@ def run_claude_in_docker(
         lead_rendered = lead_rendered.replace("{" + key + "}", value)
     workspace.mkdir(parents=True, exist_ok=True)
     lead_path = workspace / ".lead-orchestrator.md"
-    lead_path.write_text(lead_rendered)
-
-    # Clean up the previous result and plan (in case one was orphaned by an earlier run)
     result_path = workspace / ".orchestrator-result.json"
-    result_path.unlink(missing_ok=True)
     plan_path = workspace / ".orchestrator-plan.md"
-    plan_path.unlink(missing_ok=True)
+    # Clean up the previous ones (orphaned by an earlier run, or swapped for a
+    # directory by one, which would otherwise block every later run).
+    for leftover in (lead_path, result_path, plan_path):
+        _remove_path(leftover)
+    lead_path.write_text(lead_rendered)
 
     claude_home = Path.home() / ".claude"
     claude_json = Path.home() / ".claude.json"
@@ -887,9 +890,12 @@ def run_claude_in_docker(
 
     cmd = [
         "docker", "run", "--rm",
-        # Sin pty, claude es el PID 1 del container: sin un init, los nietos
-        # que dejan los Bash del agente quedan zombies.
+        # Without a pty, claude is the container's PID 1: with no init, the
+        # grandchildren the agent's Bash calls leave behind become zombies.
         "--init",
+        # The prompt goes in on stdin, not in argv: an argv element is capped
+        # at 128 KiB (MAX_ARG_STRLEN) and a long issue body would fail with E2BIG.
+        "-i",
         "--name", container_name,
         "--network=host",
         "--user", uid_gid,
@@ -902,6 +908,9 @@ def run_claude_in_docker(
     # The harness pipelines run with a prompt from an external source: the
     # body of an issue or a production error, not something the operator
     # wrote. Their scope is cut down on two fronts.
+    # Computed before anything that needs cleaning up: it reads the project
+    # folder, and a surprise there must not leave a home with credentials behind.
+    ro_siblings = worktree.readonly_siblings(project_path, subrepo) if hardened else []
     if hardened:
         # 1. Only the memory folder, not the whole vault. It is the only
         #    thing the pipeline needs from Obsidian.
@@ -917,6 +926,18 @@ def run_claude_in_docker(
             config, container_home, run_id,
         )
         cmd += home_mounts
+        # 4. In an umbrella project /workspace is the project folder, read-write.
+        #    The worktree covers only the run's sub-repo: the siblings (and
+        #    the umbrella's own .git) are reading context, so they go on top
+        #    read-only. Otherwise an injected prompt could plant a hook or
+        #    rewrite HEAD in a repo the run does not even touch.
+        for sibling in ro_siblings:
+            rel = sibling.relative_to(project_path)
+            if ":" in str(sibling):
+                logger.warning("%s has a ':' in its path, which docker -v cannot mount: "
+                               "it stays writable from the container", sibling)
+                continue
+            cmd += ["-v", f"{sibling}:/workspace/{rel}:ro"]
     else:
         agent_home, extra_env, finish_home = None, {}, None
         cmd += ["-v", f"{vault}:/obsidian"]
@@ -936,7 +957,6 @@ def run_claude_in_docker(
         "-e", f"HOME={container_home}",
         "-e", f"CLAUDE_PROJECT={project_name}",
         "-e", f"BRIEF_SLUG={brief_slug}",
-        "-e", f"GH_TOKEN={gh_token}",
         "-e", f"MAX_ITERATIONS={config['max_iterations']}",
         "-e", f"PR_STRATEGY={pr_strategy}",
         "-e", "IS_SANDBOX=1",
@@ -958,7 +978,8 @@ def run_claude_in_docker(
         for key, value in GIT_HTTPS_ENV.items():
             cmd += ["-e", f"{key}={value}"]
     # Only the name: docker inherits it from this process's environment and
-    # the value never shows up in `ps`.
+    # the value never shows up in `ps` or /proc/<pid>/cmdline.
+    extra_env = {**extra_env, "GH_TOKEN": gh_token}
     for key in extra_env:
         cmd += ["-e", key]
     cmd += ["-w", "/workspace", config["docker_image"]]
@@ -969,8 +990,9 @@ def run_claude_in_docker(
     # event goes out on its own line as it happens. And the pty was costly:
     # with stdin on /dev/null, `script` sometimes spins without draining the
     # pty, claude blocks on write and the run freezes until the timeout.
+    # No prompt in argv: `claude -p` reads it from stdin (see "-i" above).
     claude_args = [
-        "claude", "-p", prompt,
+        "claude", "-p",
         "--append-system-prompt-file", "/workspace/.lead-orchestrator.md",
         "--dangerously-skip-permissions",
         # `claude -p` in text mode prints NOTHING until the final message, so
@@ -983,7 +1005,7 @@ def run_claude_in_docker(
     if hardened:
         # The worktree was created with --no-checkout: the checkout runs here,
         # in the container, with whatever filters and LFS the repo has, not on the host.
-        cmd += ["sh", "-c", 'git -C "/workspace/$SUBREPO" reset --hard --quiet && exec '
+        cmd += ["sh", "-c", 'git -C "/workspace/$SUBREPO" reset --hard --quiet </dev/null && exec '
                 + " ".join(shlex.quote(a) for a in claude_args)]
     else:
         cmd += claude_args
@@ -1019,12 +1041,17 @@ def run_claude_in_docker(
                 "-v", f"{wt.git_dir}:{wt.git_dir}",
                 "-v", f"{hooks}:{hooks}:ro",
             ]
-        with open(run_log, "w") as f:
+        # An anonymous file (no name on disk, gone when closed) rather than a
+        # pipe: nobody has to keep feeding it while the run is watched.
+        with open(run_log, "w") as f, tempfile.TemporaryFile("w+", encoding="utf-8") as prompt_in:
+            prompt_in.write(prompt)
+            prompt_in.flush()
+            prompt_in.seek(0)
             f.write(f"# Run: {project_name} @ {datetime.now().isoformat()}\n\n")
             f.flush()
             proc = subprocess.Popen(
                 cmd,
-                stdin=subprocess.DEVNULL,
+                stdin=prompt_in,
                 stdout=f,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1131,28 +1158,80 @@ def run_claude_in_docker(
 
         return returncode, run_log, pr_data
     finally:
+        # Each step runs on its own: one that raises (the agent chmodded a
+        # dotfile or swapped it for a directory) must not skip the ones after
+        # it. Security first — the token scrub and the throwaway home — and
+        # the harmless dotfiles last.
+        #
         # Killing the docker client (timeout, exception, Ctrl-C) does not stop
         # the container: it would keep working, and pushing, with nobody
-        # reading its output. Before removing its worktree, not after.
+        # reading its output. Before anything else, and before removing its
+        # worktree.
+        # A Ctrl-C in the middle of a step does not skip the rest either: it
+        # is raised again once every step has run.
+        interrupted: list[BaseException] = []
         if not container_exited:
-            worktree.kill_container(container_name)
-        if lead_path.exists():
-            lead_path.unlink()
-        result_path.unlink(missing_ok=True)
-        plan_path.unlink(missing_ok=True)
+            _cleanup(interrupted, "kill the container", worktree.kill_container, container_name)
         if hardened:
-            guard_git_remote(repo_path, origin_before)
-            unsafe = worktree.unsafe_git_config(repo_path)
-            if unsafe:
-                logger.error("After the run, the config of %s is no longer safe: %s. The "
-                             "next run will reject it; check .git/config by hand",
-                             repo_path, unsafe)
-        if wt is not None:
-            worktree.remove(repo_path, wt)
+            _cleanup(interrupted, "restore the git remote", guard_git_remote, repo_path, origin_before)
+            _cleanup(interrupted, "check the repo config", _report_unsafe_config, repo_path)
+            _cleanup(interrupted, "check the umbrella for new repos", _report_new_repos,
+                     project_path, subrepo, ro_siblings)
         if finish_home is not None:
-            finish_home()
+            _cleanup(interrupted, "write back the agent credentials", finish_home)
         if agent_home is not None:
-            shutil.rmtree(agent_home, ignore_errors=True)
+            _cleanup(interrupted, "delete the agent home", _remove_path, agent_home)
+        if wt is not None:
+            _cleanup(interrupted, "remove the worktree", worktree.remove, repo_path, wt)
+        _cleanup(interrupted, "delete .lead-orchestrator.md", _remove_path, lead_path)
+        _cleanup(interrupted, "delete the result file", _remove_path, result_path)
+        _cleanup(interrupted, "delete the plan file", _remove_path, plan_path)
+        if interrupted:
+            raise interrupted[0]
+
+
+def _cleanup(interrupted: list, step: str, fn, *args) -> None:
+    """Runs one cleanup step of a run; logs a failure instead of raising it."""
+    try:
+        fn(*args)
+    except Exception as e:
+        logger.error("Run cleanup: could not %s: %s", step, e)
+    except BaseException as e:
+        logger.error("Run cleanup: interrupted while trying to %s", step)
+        interrupted.append(e)
+
+
+def _remove_path(path: Path) -> None:
+    """Deletes a file, a symlink or a whole tree, even one the agent left read-only.
+
+    Raises when something is left, so the cleanup logs it: a copy of the
+    credentials that stays on disk must not go unnoticed.
+    """
+    if path.is_symlink() or not path.is_dir():
+        path.unlink(missing_ok=True)
+    else:
+        shutil.rmtree(path, **worktree._RMTREE_ERR)
+    if path.is_symlink() or path.exists():
+        raise OSError(f"{path} is still there — delete it by hand")
+
+
+def _report_new_repos(project_path: str, subrepo: str, before: list[Path]) -> None:
+    """A repo that appeared in the umbrella during the run was created by the agent.
+
+    It was writable (only repos that existed are mounted read-only), so it may
+    carry a hook or an fsmonitor that runs the next time someone uses git there.
+    """
+    for repo in sorted(set(worktree.readonly_siblings(project_path, subrepo)) - set(before)):
+        logger.error("The run created a git repo at %s — inspect or delete it before "
+                     "running git there", repo)
+
+
+def _report_unsafe_config(repo: Path) -> None:
+    unsafe = worktree.unsafe_git_config(repo)
+    if unsafe:
+        logger.error("After the run, the config of %s is no longer safe: %s. The "
+                     "next run will reject it; check .git/config by hand",
+                     repo, unsafe)
 
 
 # ── Closing a brief: done or failed ──────────────────────────────────────────
@@ -1375,7 +1454,7 @@ def notify_telegram(
     run_log_path: Path | None,
     pr_data: dict | None = None,
 ) -> None:
-    token = config.get("telegram_bot_token", "")
+    token = secrets_env.telegram_token(config)
     chat_id = config.get("telegram_chat_id", "")
     if not token or not chat_id:
         logger.debug("Telegram not configured, skip notify")

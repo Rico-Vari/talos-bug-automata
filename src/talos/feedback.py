@@ -288,7 +288,9 @@ def notify_stale_merged_dev(config: dict, gh_repo: str, issue: int | str, title:
 
 
 def _telegram(config: dict, text: str) -> None:
-    token = config.get("telegram_bot_token", "")
+    from talos import secrets_env
+
+    token = secrets_env.telegram_token(config)
     chat_id = config.get("telegram_chat_id", "")
     if not token or not chat_id:
         return

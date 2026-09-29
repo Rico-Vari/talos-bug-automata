@@ -4,7 +4,7 @@ The Telegram bot is the control panel. It runs passes, shows the queue and the
 event ledger, pauses the harness, and creates briefs from the chat. Dispatch
 and the event harness also use it to send notifications.
 
-Telegram is optional. If `telegram_bot_token` and `telegram_chat_id` are
+Telegram is optional. If the bot token and `telegram_chat_id` are
 empty, dispatch skips notifications without a warning and everything else
 works. The bot process itself (`talos-bot`) won't start without both.
 
@@ -21,12 +21,25 @@ works. The bot process itself (`talos-bot`) won't start without both.
    ```
 
    Look for `"chat":{"id": XXXXXXX}`. That number is your `chat_id`.
-3. **Put both in `config.yaml`:**
+3. **Put the token in `~/.orchestrator/secrets.env` and the rest in
+   `config.yaml`.** The token is a secret, so `config.yaml` only names the
+   variable that holds it:
+
+   ```bash
+   # ~/.orchestrator/secrets.env (mode 0600)
+   TELEGRAM_BOT_TOKEN=1234567890:ABCdef...
+   ```
 
    ```yaml
-   telegram_bot_token: "1234567890:ABCdef..."
+   # config.yaml
    telegram_chat_id: "987654321"
+   secrets:
+     telegram_bot_token_env: TELEGRAM_BOT_TOKEN
    ```
+
+   A literal `telegram_bot_token: "..."` in `config.yaml` still works, with a
+   warning in the log. If you move it, rotate the token with BotFather's
+   `/revoke`: the old value may be in backups or shell history.
 
 4. Start the bot with `systemctl --user start talos-bot` (see
    [setup.md](setup.md#run-as-systemd-user-services)), or with

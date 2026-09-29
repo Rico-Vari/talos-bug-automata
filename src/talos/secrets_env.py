@@ -9,6 +9,7 @@ EnvironmentFile. That way "is this field a secret?" is never ambiguous.
 """
 from __future__ import annotations
 
+import logging
 import os
 
 SECRETS_FILE = "~/.orchestrator/secrets.env"
@@ -17,6 +18,9 @@ SECRETS_FILE = "~/.orchestrator/secrets.env"
 # still carries it is not configured, and treating it as valid would produce
 # a confusing 401 instead of a clear error at startup.
 PLACEHOLDER_SUFFIX = "_REPLACE_ME"
+
+logger = logging.getLogger("talos")
+_warned_literal_telegram = False
 
 
 class MissingSecret(RuntimeError):
@@ -47,6 +51,36 @@ def resolve_secret(cfg: dict, key: str, *, required: bool = True) -> str:
             )
         return ""
     return value
+
+
+def telegram_token(cfg: dict) -> str:
+    """The Telegram bot token, or '' when Telegram is not configured.
+
+    `secrets.telegram_bot_token_env` names the variable that holds it
+    (TELEGRAM_BOT_TOKEN when the key is missing). A literal
+    `telegram_bot_token` in config.yaml still works, so an existing install
+    keeps notifying, but it breaks the rule above and gets a warning.
+    """
+    global _warned_literal_telegram
+    named = (cfg.get("secrets") or {}).get("telegram_bot_token_env", "")
+    var = named or "TELEGRAM_BOT_TOKEN"
+    value = os.environ.get(var, "")
+    if value and not value.endswith(PLACEHOLDER_SUFFIX):
+        return value
+    literal = str(cfg.get("telegram_bot_token") or "")
+    if not _warned_literal_telegram and (literal or named):
+        _warned_literal_telegram = True
+        if named:
+            logger.warning("secrets.telegram_bot_token_env names %s, which is not set in "
+                           "%s%s", var, SECRETS_FILE,
+                           ": using the literal telegram_bot_token" if literal else
+                           ": Telegram notifications are off")
+        else:
+            logger.warning(
+                "telegram_bot_token is a literal in config.yaml: move it to %s as %s "
+                "and set secrets.telegram_bot_token_env", SECRETS_FILE, var,
+            )
+    return literal
 
 
 def load_dotenv(path: str = SECRETS_FILE) -> int:
