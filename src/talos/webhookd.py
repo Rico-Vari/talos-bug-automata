@@ -339,6 +339,9 @@ def _handle_gh_review(target, delivery_id, payload, raw_path, event, action) -> 
         triage.gate_self_review(body),
         triage.gate_review_body(body, review.get("state", "")),
         triage.gate_author(target.cfg, actor),
+        # The review body becomes stage B's prompt: on a public repo anyone
+        # can comment on a PR, so it needs the same gate as an issue.
+        triage.gate_association(review if event == "pull_request_review" else comment),
     ):
         if not gate.admitted:
             return _reject_delivery(delivery_id, "github", event, action, raw_path,

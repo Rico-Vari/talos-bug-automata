@@ -245,5 +245,10 @@ values never show up in `ps`.
   could post comments or push branches in repos that `GH_TOKEN` can reach.
   Branch protection on your integration and production branches is strongly
   recommended.
-- **The harness assumes private repos.** With no opt-in label, anyone who can
-  open an issue feeds the prompt. For public repos, set `authors_allow`.
+- **Only people with write access feed a prompt.** Issues, reviews and review
+  comments pass only when their `author_association` is `OWNER`, `MEMBER` or
+  `COLLABORATOR` (a missing value is rejected). Collaborators are trusted:
+  anyone you give write access can steer an agent. On public repos, also
+  consider `authors_allow`. Stage B's agent still reads the PR thread through
+  `gh`, so a stranger's comment on a harness PR can reach it as data (inside
+  the untrusted-data fences) even though it cannot start a round.

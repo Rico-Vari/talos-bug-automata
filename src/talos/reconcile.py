@@ -388,6 +388,8 @@ def human_comments(gh_repo: str, number: int) -> list[dict]:
     PR's standalone comments. The filter is by the marker in the body and not
     by author, because the harness posts with the repo owner's token.
     """
+    from talos import triage
+
     found: list[dict] = []
     for item in (gh_paginated(f"repos/{gh_repo}/pulls/{number}/comments?per_page=100") or []):
         found.append({
@@ -396,6 +398,7 @@ def human_comments(gh_repo: str, number: int) -> list[dict]:
             "at": item.get("created_at") or "",
             "login": ((item.get("user") or {}).get("login")) or "?",
             "type": ((item.get("user") or {}).get("type")) or "User",
+            "author_association": item.get("author_association") or "",
             "kind": "pull_request_review_comment",
         })
     for item in (gh_paginated(f"repos/{gh_repo}/pulls/{number}/reviews?per_page=100") or []):
@@ -406,12 +409,17 @@ def human_comments(gh_repo: str, number: int) -> list[dict]:
             "login": ((item.get("user") or {}).get("login")) or "?",
             "type": ((item.get("user") or {}).get("type")) or "User",
             "state": item.get("state") or "",
+            "author_association": item.get("author_association") or "",
             "kind": "pull_request_review",
         })
 
+    # Comments from people without write access are ignored outright, not
+    # just rejected later: otherwise a stranger's newer comment would hide
+    # the owner's older one and the round would never open.
     out = [
         c for c in found
         if c["at"] and c["body"].strip() and not is_harness_authored(c["body"])
+        and (c["author_association"] or "").upper() in triage.TRUSTED_ASSOCIATIONS
     ]
     return sorted(out, key=lambda c: c["at"])
 
@@ -748,6 +756,7 @@ def _round_if_pending(cfg: dict, target, pr: dict) -> dict | None:
             "created_at": newest["at"],
             "submitted_at": newest["at"],
             "state": newest.get("state") or "",
+            "author_association": newest.get("author_association") or "",
         },
         "repository": {"full_name": target.gh_repo},
         "_synthetic": {"by": "reconcile.py", "at": utcnow()},

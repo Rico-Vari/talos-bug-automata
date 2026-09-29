@@ -358,10 +358,13 @@ container:
 
 ## Every issue gets in: what keeps it under control
 
-There's no opt-in label: any new issue triggers the harness. This works
-because the repos are private, so whoever opens an issue is on your team. If
-your repo is public or has outside contributors, use `authors_allow` (see
-below). These are the limits:
+There's no opt-in label: any new issue from someone with write access
+triggers the harness. Issues, reviews and review comments are only admitted
+when GitHub reports the author as `OWNER`, `MEMBER` or `COLLABORATOR`; anyone
+else (including `CONTRIBUTOR` and `FIRST_TIME_CONTRIBUTOR`) is rejected as
+`rejected_author_association`, so a public repo does not hand strangers a
+prompt. `authors_allow` narrows that further to specific logins. These are
+the limits:
 
 - **`activated_at`**: the backlog doesn't get in by itself.
 - **`ai-skip`** (`skip_label`): opt-out per issue. If you add it after the
@@ -372,6 +375,9 @@ below). These are the limits:
 - **`daily_cap` / `global_daily_cap`**: stage A runs started today (UTC).
 - **`cooldown_minutes`**: minimum time between two stage A runs in the same
   repo.
+- **Author association**: only `OWNER`, `MEMBER` and `COLLABORATOR` feed a
+  prompt, on issues and on review comments alike. The reconciler ignores
+  other people's PR comments entirely.
 - **`authors_allow`**: when it isn't empty, only these GitHub logins get in.
   Bot authors are rejected unless they're listed.
 - **`events.db`**: the main re-entry guard. An issue that has a row doesn't
