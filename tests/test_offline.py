@@ -61,17 +61,23 @@ class Sandbox:
 
     def __enter__(self):
         from talos import store
+        from talos import util
         from talos import webhookd
         from talos import worktree
 
         self.root = Path(tempfile.mkdtemp(prefix="orq-test-"))
         self.store = store
+        self.util = util
         self.webhookd = webhookd
         self.worktree = worktree
         self._saved = (store.DB_PATH, store.RAW_DIR, webhookd.kick_dispatch, webhookd.CFG,
-                       worktree.WORKTREES_DIR, worktree.WORKSPACES_DIR, worktree._docker)
+                       worktree.WORKTREES_DIR, worktree.WORKSPACES_DIR, worktree._docker,
+                       util.USAGE_LIMIT_FILE)
         store.DB_PATH = self.root / "events.db"
         store.RAW_DIR = self.root / "raw"
+        # A usage-limit wait on the machine must not halt the tests' passes,
+        # and a test's park must not halt the machine's.
+        util.USAGE_LIMIT_FILE = str(self.root / "USAGE_LIMIT")
         # Nothing a test runs may land in the real ~/.orchestrator.
         worktree.WORKTREES_DIR = self.root / "worktrees"
         worktree.WORKSPACES_DIR = self.root / "workspaces"
@@ -113,7 +119,7 @@ class Sandbox:
         (self.store.DB_PATH, self.store.RAW_DIR,
          self.webhookd.kick_dispatch, self.webhookd.CFG,
          self.worktree.WORKTREES_DIR, self.worktree.WORKSPACES_DIR,
-         self.worktree._docker) = self._saved
+         self.worktree._docker, self.util.USAGE_LIMIT_FILE) = self._saved
         shutil.rmtree(self.root, ignore_errors=True)
 
 
@@ -435,6 +441,112 @@ def test_pause_stops_dispatch_not_admission() -> None:
         check("a /pause halfway through the pass stops the ones that follow", len(calls) == 1, str(calls))
 
 
+def test_run_window_parsing() -> None:
+    """D3b: run_window parses, rejects bad input and handles midnight."""
+    print("\nD3b — run_window parsing and edges")
+    from datetime import datetime, timezone
+
+    from talos.util import in_run_window, parse_run_window
+
+    cancun = parse_run_window({"timezone": "America/Cancun", "start": "19:00", "end": "06:00"})
+    check("no block means always on", parse_run_window(None) is None and in_run_window(None))
+
+    def at(hh: int, mm: int = 0) -> datetime:
+        # Cancun is UTC-5 all year (no DST since 2015).
+        return datetime(2026, 10, 3, (hh + 5) % 24, mm, tzinfo=timezone.utc)
+
+    check("23:30 Cancun is inside", in_run_window(cancun, at(23, 30)))
+    check("02:00 Cancun is inside", in_run_window(cancun, at(2)))
+    check("14:00 Cancun is outside", not in_run_window(cancun, at(14)))
+    check("19:00 is inclusive", in_run_window(cancun, at(19)))
+    check("06:00 is exclusive", not in_run_window(cancun, at(6)))
+    check("05:59 is inside", in_run_window(cancun, at(5, 59)))
+    # 20:00 UTC would be inside unconverted; in Cancun it is 15:00.
+    check("a UTC clock is converted to the window's zone",
+          not in_run_window(cancun, datetime(2026, 10, 3, 20, 0, tzinfo=timezone.utc)))
+
+    day = parse_run_window({"timezone": "UTC", "start": "09:00", "end": "17:00"})
+    check("same-day window: 12:00 inside",
+          in_run_window(day, datetime(2026, 10, 3, 12, tzinfo=timezone.utc)))
+    check("same-day window: 17:00 outside",
+          not in_run_window(day, datetime(2026, 10, 3, 17, tzinfo=timezone.utc)))
+
+    local = parse_run_window({"start": "19:00", "end": "06:00"})
+    check("no timezone means system local time", local.tz is None)
+    check("empty timezone means system local time",
+          parse_run_window({"start": "19:00", "end": "06:00", "timezone": ""}).tz is None)
+
+    # PyYAML reads an unquoted 19:00 as the sexagesimal int 1140.
+    import yaml
+    unquoted = parse_run_window(yaml.safe_load("start: 19:00\nend: 06:00\ntimezone: America/Cancun"))
+    check("unquoted YAML times parse",
+          (unquoted.start.hour, unquoted.end.hour) == (19, 6), str(unquoted))
+
+    for bad in ({"start": "19:00", "end": "06:00", "timezone": "Mars/Base"},
+                {"start": "25:00", "end": "06:00"},
+                {"start": "07:00", "end": "07:00"},
+                {"start": "19:00"},
+                {"end": "06:00"},
+                {"start": True, "end": "06:00"},
+                {"start": 19, "end": 6},
+                {"start": "19:00", "end": "06:00", "tz": "America/Cancun"},
+                {"start": "19:00", "end": "06:00", "timezone": 0},
+                {"start": "19:00", "end": "06:00", "timezone": "America"},
+                ["19:00", "06:00"]):
+        try:
+            parse_run_window(bad)
+            check(f"rejects {bad!r}", False, "no error")
+        except ValueError:
+            check(f"rejects {bad!r}", True)
+
+
+def test_run_window_stops_runs_not_reconciler() -> None:
+    """D3c: outside the window, no run starts but the reconciler still runs."""
+    print("\nD3c — run_window = no runs, reconciler goes on")
+    from datetime import datetime, timezone
+
+    import frontmatter
+
+    from talos import dispatch
+    from talos.util import parse_run_window
+
+    with Sandbox() as sb:
+        for name in ("a.md", "b.md"):
+            _write_brief(sb.vault / "ToDos" / name, {"project": "sandbox", "status": "pending"})
+
+        afternoon = datetime(2026, 10, 3, 20, 0, tzinfo=timezone.utc)  # 15:00 Cancun
+        night = datetime(2026, 10, 4, 3, 0, tzinfo=timezone.utc)       # 22:00 Cancun
+
+        def run(clock: datetime | list, ignore_schedule: bool = False) -> tuple[list, list]:
+            calls, reconciled = [], []
+            clocks = iter(clock) if isinstance(clock, list) else None
+            cfg = sb.cfg()
+            cfg["_run_window"] = parse_run_window(
+                {"timezone": "America/Cancun", "start": "19:00", "end": "06:00"})
+            real = dispatch.in_run_window
+            with patched(dispatch, "is_paused", lambda: False), \
+                 patched(dispatch, "in_run_window",
+                         lambda w: real(w, next(clocks) if clocks else clock)), \
+                 patched(dispatch, "run_reconciler", lambda c: reconciled.append(1)), \
+                 patched(dispatch, "process_brief", lambda b, c, dry_run: calls.append(b.path.name)), \
+                 patched(dispatch, "LOCK_FILE", sb.root / "dispatch.lock"):
+                dispatch.run_once(cfg, ignore_schedule=ignore_schedule)
+            return calls, reconciled
+
+        calls, reconciled = run(afternoon)
+        check("outside the window no brief runs", calls == [], str(calls))
+        check("outside the window the reconciler still runs", reconciled == [1])
+        check("and the briefs stay pending",
+              all(frontmatter.load(p).metadata.get("status") == "pending"
+                  for p in (sb.vault / "ToDos").glob("*.md")))
+        calls, _ = run(night)
+        check("the first pass inside the window picks them up", len(calls) == 2, str(calls))
+        calls, _ = run(afternoon, ignore_schedule=True)
+        check("--ignore-schedule runs them anyway", len(calls) == 2, str(calls))
+        calls, _ = run([night, afternoon])
+        check("a window that closes mid-pass stops the ones that follow", len(calls) == 1, str(calls))
+
+
 def test_hardened_home_is_disposable() -> None:
     """D4: the hardened container does not see the host's settings, hooks or MCP."""
     print("\nD4 — disposable ~/.claude")
@@ -461,6 +573,16 @@ def test_hardened_home_is_disposable() -> None:
             check("a refreshed token goes back to the host",
                   "refreshed" in (fake_home / ".claude" / ".credentials.json").read_text())
 
+            # A parked run's home, pruned to its transcripts, is rebuilt around them.
+            (home / ".claude" / "projects" / "-workspace").mkdir(parents=True)
+            (home / ".claude" / "projects" / "-workspace" / "s.jsonl").write_text("{}")
+            dispatch.park_agent_home(home)
+            home2, _, _, _ = dispatch.prepare_agent_home({"secrets": {}}, "/home/agent", "r1")
+            check("reusing the run id keeps the session transcript and copies fresh credentials",
+                  home2 == home and (home / ".claude" / "projects" / "-workspace" / "s.jsonl").exists()
+                  and "refreshed" in (home / ".claude" / ".credentials.json").read_text()
+                  and (home / ".claude.json").exists())
+
             os.environ["ORQ_TEST_TOKEN"] = "sk-oat-test"
             try:
                 _, mounts2, env2, _ = dispatch.prepare_agent_home(
@@ -469,6 +591,197 @@ def test_hardened_home_is_disposable() -> None:
                 del os.environ["ORQ_TEST_TOKEN"]
             check("with a configured token it goes through the environment",
                   env2.get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-oat-test")
+
+
+def test_usage_limit_parks_the_queue() -> None:
+    """A usage-limit hit parks the brief, holds the queue for an hour and does not fail anything."""
+    print("\nClaude usage limit — park, wait, resume first")
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    import frontmatter
+
+    from talos import dispatch
+    from talos import feedback
+    from talos import store
+    from talos import util
+
+    with Sandbox() as sb:
+        log = sb.root / "run.log"
+
+        def stream(*events) -> Path:
+            log.write_text("# Run: x\n" + "".join(json.dumps(e) + "\r\n" for e in events))
+            return log
+
+        init = {"type": "system", "subtype": "init", "session_id": "s-9"}
+        for text in ("You've hit your limit · resets 7pm (America/Cancun)",
+                     "Session limit reached ∙ resets 7pm", "Weekly limit reached ∙ resets Sun 3pm",
+                     "Claude AI usage limit reached|1759525200", "API Error: Rate limit reached"):
+            msg = dispatch.usage_limit_message(stream(init, {"type": "result", "is_error": True, "result": text}))
+            check(f"detects {text[:28]!r}", msg == text, str(msg))
+        check("an API 500 is not a usage limit",
+              dispatch.usage_limit_message(stream(init, {"type": "result", "is_error": True,
+                                                         "result": "API Error: 500 Internal server error"})) is None)
+        talk = {"type": "assistant", "message": {"model": "claude-x", "content": [
+            {"type": "text", "text": "Limit reached: giving up"}]}}
+        check("text the agent wrote is not the limit, even as its last word",
+              dispatch.usage_limit_message(stream(init, talk)) is None
+              and dispatch.usage_limit_message(stream(init, talk, {
+                  "type": "result", "is_error": False, "result": "Limit reached: giving up"})) is None)
+        check("only the CLI's error result counts",
+              dispatch.usage_limit_message(stream(init, talk, {
+                  "type": "result", "is_error": True, "result": "Usage limit reached"})) == "Usage limit reached")
+        synthetic = {"type": "assistant", "message": {"model": "<synthetic>", "content": [
+            {"type": "text", "text": "Session limit reached"}]}}
+        check("a run with only the CLI's synthetic message did no work",
+              not dispatch.run_did_work(stream(init, synthetic))
+              and dispatch.run_did_work(stream(init, talk, synthetic)))
+        check("the session id comes from the stream",
+              dispatch.read_session_id(stream(init, {"type": "result", "session_id": "s-9"})) == "s-9")
+
+        util.set_usage_limit(datetime.now(timezone.utc) + timedelta(minutes=5))
+        check("a marker in the future is an active wait", util.usage_limit_until() is not None)
+        util.set_usage_limit(datetime.now(timezone.utc) - timedelta(minutes=1))
+        check("an expired one is not", util.usage_limit_until() is None)
+        Path(util.USAGE_LIMIT_FILE).write_text("garbage")
+        check("nor is an unreadable one", util.usage_limit_until() is None)
+        check("clear_usage_limit removes it", util.clear_usage_limit() and util.usage_limit_until() is None)
+
+        # process_brief: the limit parks instead of failing.
+        cfg = sb.cfg()
+        with store.connect() as c:
+            eid, _ = store.upsert_event(c, f"gh:{REPO}#60", {
+                "gh_repo": REPO, "gh_issue": 60, "pipeline": "issue-fix",
+                "state": "admitted", "source": "github"})
+        path = _write_brief(sb.vault / "ToDos" / "lim.md", {
+            "project": "sandbox", "status": "pending", "pipeline": "issue-fix",
+            "event_id": eid, "gh_repo": REPO, "gh_issue": 60,
+            "resume_run_id": "old-run", "resume_session_id": "old-sess"})
+        parked = {"status": "usage_limit", "summary": "You've hit your limit", "prs": [],
+                  "resume": {"run_id": "r-1", "session_id": "s-1"}}
+        announced, telegram, on_disk = [], [], []
+
+        def fake_run(prompt, brief, *a):
+            on_disk.append(dict(frontmatter.load(brief.path).metadata))
+            return 1, log, dict(parked)
+
+        def process() -> dict:
+            with patched(dispatch, "run_claude_in_docker", fake_run), \
+                 patched(dispatch, "still_wanted", lambda *a: (True, "", "")), \
+                 patched(dispatch, "notify_telegram", lambda *a, **k: telegram.append(a[3])), \
+                 patched(feedback, "announce_failure", lambda *a: announced.append(a)):
+                return dispatch.process_brief(_brief(path), cfg, dry_run=False)
+
+        res = process()
+        meta = frontmatter.load(path).metadata
+        with store.connect() as c:
+            row = store.get_event(c, eid)
+        check("the run sees no stale resume data on disk while it runs",
+              "resume_run_id" not in on_disk[0] and on_disk[0].get("status") == "running", str(on_disk))
+        check("the brief goes back to pending with the new resume data",
+              res["status"] == "usage_limit" and meta.get("status") == "pending"
+              and meta.get("resume_run_id") == "r-1" and meta.get("resume_session_id") == "s-1", str(meta))
+        check("the ledger row goes back to admitted, not failed",
+              row["state"] == "admitted" and row["claimed_at"] is None, row["state"])
+        check("nothing is reported on the source", announced == [])
+        until = util.usage_limit_until()
+        check("the queue waits usage_limit_retry_minutes (60 by default)",
+              until is not None and 59 * 60 < (until - datetime.now(timezone.utc)).total_seconds() <= 3600,
+              str(until))
+        check("Telegram hears about the first park", telegram == ["usage_limit"], str(telegram))
+        process()
+        check("but not about the hourly retries", telegram == ["usage_limit"], str(telegram))
+        check("which keep counting", frontmatter.load(path).metadata.get("usage_limit_hits") == 2)
+        parked["did_work"] = True
+        process()
+        check("a resumed run that worked and hit the limit again is a new notice",
+              telegram == ["usage_limit", "usage_limit"], str(telegram))
+        parked.pop("did_work")
+
+        # Parked for longer than the weekly limit: it fails, it does not wait forever.
+        post = frontmatter.load(path)
+        post.metadata["usage_limit_since"] = (datetime.now(timezone.utc) - timedelta(days=9)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        path.write_text(frontmatter.dumps(post))
+        res = process()
+        with store.connect() as c:
+            row = store.get_event(c, eid)
+        check("a brief parked more than KEEP_MAX_DAYS ago fails on its next hit",
+              res["status"] == "failed" and frontmatter.load(path).metadata.get("status") == "failed"
+              and row["state"] == "failed" and len(announced) == 1, str((res["status"], row["state"])))
+        post = frontmatter.load(path)
+        post.metadata.update({"status": "pending", "resume_run_id": "r-1", "resume_session_id": "s-1"})
+        for key in ("usage_limit_since", "usage_limit_hits"):
+            post.metadata.pop(key, None)
+        path.write_text(frontmatter.dumps(post))
+        util.clear_usage_limit()
+
+        # A parked brief that closes without resuming lets go of its worktree,
+        # and an agent home with nothing to resume goes at the start of a pass.
+        wts = sb.root / "worktrees"
+        wts.mkdir(exist_ok=True)
+        (wts / "gone-run.keep").write_text("x\n")
+        skipped = _write_brief(sb.vault / "ToDos" / "skip.md", {
+            "project": "sandbox", "status": "pending", "resume_run_id": "gone-run"})
+        dispatch.skip_brief(cfg, _brief(skipped), "issue closed", "closed")
+        check("skip_brief releases the kept worktree", not (wts / "gone-run.keep").exists())
+        homes = sb.root / "agent-home"
+        for name in ("r-1", "stale-run"):
+            (homes / name / ".claude" / "projects").mkdir(parents=True)
+        (wts / "r-1.keep").write_text("x\n")
+        with patched(dispatch, "AGENT_HOMES_DIR", homes):
+            dispatch.sweep_agent_homes()
+        check("sweep_agent_homes keeps a parked run's home and deletes the rest",
+              sorted(h.name for h in homes.iterdir()) == ["r-1"], str(list(homes.iterdir())))
+        (wts / "r-1.keep").unlink()
+
+        # run_once: the parked brief goes first, a park halts the pass, and
+        # the wait holds every run while the reconciler goes on.
+        _write_brief(sb.vault / "ToDos" / "2026-01-01-a.md",
+                     {"project": "sandbox", "status": "pending", "priority": "high"})
+        _write_brief(sb.vault / "ToDos" / "2026-01-02-b.md",
+                     {"project": "sandbox", "status": "pending", "priority": "high"})
+
+        def run(answer) -> tuple[list, list]:
+            calls, reconciled = [], []
+
+            def fake_process(b, c, dry_run):
+                calls.append(b.path.name)
+                return answer(b)
+
+            with patched(dispatch, "is_paused", lambda: False), \
+                 patched(dispatch, "run_reconciler", lambda c: reconciled.append(1)), \
+                 patched(dispatch, "process_brief", fake_process), \
+                 patched(dispatch, "cap_verdict", lambda c, b: cap), \
+                 patched(dispatch, "defer_brief", lambda c, b, v: deferred.append(b.path.name)), \
+                 patched(dispatch, "AGENT_HOMES_DIR", sb.root / "agent-home"), \
+                 patched(dispatch, "LOCK_FILE", sb.root / "dispatch.lock"):
+                dispatch.run_once(cfg)
+            return calls, reconciled
+
+        from talos import triage
+        cap, deferred = triage.OK, []
+
+        def limit(b):
+            util.set_usage_limit(datetime.now(timezone.utc) + timedelta(hours=1))
+            return {"brief": b, "status": "usage_limit", "pr_data": {"prs": []}}
+
+        calls, _ = run(limit)
+        check("the parked brief is tried first, and a park stops the pass", calls == ["lim.md"], str(calls))
+        check("and the rest of the queue stays pending",
+              all(frontmatter.load(sb.vault / "ToDos" / n).metadata.get("status") == "pending"
+                  for n in ("2026-01-01-a.md", "2026-01-02-b.md")))
+        calls, reconciled = run(limit)
+        check("while the wait is on no run starts, but the reconciler runs",
+              calls == [] and reconciled == [1], str(calls))
+        util.clear_usage_limit()
+        cap = triage.Verdict(False, "max_open_auto_prs", "3 open")
+        calls, _ = run(lambda b: {"brief": b, "status": "done", "pr_data": {"prs": []}})
+        check("a full open-PR cap does not hold back the parked brief's resume",
+              calls == ["lim.md"] and "lim.md" not in deferred and len(deferred) == 2, str((calls, deferred)))
+        cap = triage.OK
+        calls, _ = run(lambda b: {"brief": b, "status": "done", "pr_data": {"prs": []}})
+        check("once it lifts, the whole queue runs", len(calls) == 3 and calls[0] == "lim.md", str(calls))
 
 
 def test_sentry_event_alert() -> None:
@@ -1766,9 +2079,19 @@ def test_agent_works_in_a_worktree() -> None:
                     proc_seen["env"] = k.get("env")
                     mounts = [cmd[i + 1] for i, c in enumerate(cmd) if c == "-v"]
                     wt_mount = [m for m in mounts if m.endswith(":/workspace/sandbox")]
+                    ws_mount = [m for m in mounts if m.endswith(":/workspace")]
+                    if ws_mount:
+                        plan = Path(ws_mount[0].rsplit(":", 1)[0]) / ".orchestrator-plan.md"
+                        proc_seen["plan"] = plan.exists()
+                        if behaviour == "limit":
+                            plan.write_text("the plan\n")
                     if wt_mount:
                         path = wt_mount[0].rsplit(":", 1)[0]
+                        proc_seen["worktree"] = path
+                        proc_seen["wip"] = (Path(path) / "wip.txt").exists()
                         real_run(["git", "-C", path, "checkout", "-q", "-B", "agent-branch"], check=True)
+                        if behaviour == "limit":
+                            (Path(path) / "wip.txt").write_text("half done\n")
                         if behaviour == "plant":
                             real_run(["git", "-C", path, "config", "core.sshCommand", "touch /tmp/x"], check=True)
                         if behaviour == "init":
@@ -1796,6 +2119,14 @@ def test_agent_works_in_a_worktree() -> None:
                         return self.returncode
                     if behaviour == "crash":
                         raise KeyboardInterrupt
+                    if behaviour in ("limit", "limit-nosession"):
+                        session = ',"session_id":"sess-1"' if behaviour == "limit" else ""
+                        self.out.write('{"type":"system","subtype":"init"' + session + '}\n'
+                                       '{"type":"result","subtype":"success","is_error":true,'
+                                       '"result":"You\'ve hit your limit · resets 7pm"' + session + '}\n')
+                        self.out.flush()
+                        self.returncode = 1
+                        return 1
                     if behaviour not in ("timeout", "stall", "alive"):
                         self.returncode = 0
                         return 0
@@ -2071,6 +2402,81 @@ def test_agent_works_in_a_worktree() -> None:
         check("issue-fix with the brief's branch checked out in your checkout: does not run",
               cmd is None and isinstance(run_brief.error, worktree.WorktreeError), str(run_brief.error))
         git("checkout", "-q", "my-work")
+
+        # Usage limit: the run is parked with its worktree and session, and
+        # the next one resumes it there instead of starting from zero.
+        home = sb.root / "agent-home"
+        (home / ".claude" / "projects" / "-workspace").mkdir(parents=True)
+        (home / ".claude" / "projects" / "-workspace" / "sess-1.jsonl").write_text("{}\n")
+        (home / ".claude" / ".credentials.json").write_text("{}")
+        (home / ".claude" / "settings.json").write_text('{"hooks": {}}')
+        (home / ".claude.json").write_text("{}")
+        run_brief("review-fix", "limit")
+        rc, _, data = run_brief.result
+        kept = Path(proc_seen["worktree"])
+        check("usage limit: the run reports usage_limit with what the resume needs",
+              rc != 0 and data.get("status") == "usage_limit"
+              and data.get("resume") == {"run_id": kept.name, "session_id": "sess-1"}, str(data))
+        check("its worktree stays, with the uncommitted work in it",
+              (kept / "wip.txt").exists() and (sb.root / "worktrees" / f"{kept.name}.keep").exists())
+        check("the agent home keeps only the session transcripts",
+              (home / ".claude" / "projects" / "-workspace" / "sess-1.jsonl").exists()
+              and sorted(p.name for p in home.iterdir()) == [".claude"]
+              and sorted(p.name for p in (home / ".claude").iterdir()) == ["projects"],
+              str(sorted(str(p.relative_to(home)) for p in home.rglob("*"))))
+
+        sb.docker.clear()
+        cmd = run_brief("review-fix", resume_run_id=kept.name, resume_session_id="sess-1")
+        check("the resume mounts the same worktree, with the work still there",
+              proc_seen.get("worktree") == str(kept) and proc_seen.get("wip") is True, str((proc_seen, cmd and mounts(cmd))))
+        check("without the reset --hard, and with --resume <session> and the continue prompt on stdin",
+              cmd is not None and "sh" not in cmd and cmd[cmd.index("--resume") + 1] == "sess-1"
+              and cmd[cmd.index("claude") + 1] == "-p"
+              and proc_seen.get("stdin_text") == dispatch.RESUME_PROMPT,
+              str((cmd and cmd[-12:], proc_seen.get("stdin_text"))))
+        check("a finished resume removes the worktree and its keep marker",
+              list((sb.root / "worktrees").iterdir()) == [], str(list((sb.root / "worktrees").iterdir())))
+        check("the parked run's plan is still there for the resume, and goes when it ends",
+              proc_seen.get("plan") is True and not (sb.project / ".orchestrator-plan.md").exists())
+
+        cmd = run_brief("review-fix", resume_run_id="gone", resume_session_id="sess-1")
+        check("resume data without its worktree: starts from zero",
+              cmd is not None and "--resume" not in cmd and cmd[-3:-1] == ["sh", "-c"])
+
+        run_brief("review-fix", "limit-nosession")
+        data = run_brief.result[2]
+        check("a limit hit with no session id still parks, but keeps nothing to resume",
+              data.get("status") == "usage_limit" and data.get("resume") == {"run_id": "", "session_id": ""}
+              and list((sb.root / "worktrees").iterdir()) == [], str(data))
+
+        old, _ = worktree.create(repo, "developer", "old-park")
+        worktree.keep(old)
+        young, _ = worktree.create(repo, "developer", "young-park")
+        worktree.keep(young)
+        stamp = time.time() - (worktree.KEEP_MAX_DAYS + 1) * 86400
+        os.utime(sb.root / "worktrees" / "old-park.keep", (stamp, stamp))
+        wt, _ = worktree.create(repo, "developer", "next-run")
+        young_mark = sb.root / "worktrees" / "young-park.keep"
+        check("the sweep leaves a recently parked worktree alone",
+              young.path.exists() and young_mark.exists())
+        check("and sweeps one parked longer than KEEP_MAX_DAYS",
+              not old.path.exists() and worktree.reopen(repo, "old-park") is None)
+        worktree.remove(repo, wt)
+        worktree.keep(young)
+        worktree.remove(repo, young)
+        check("remove deletes the keep marker", not young_mark.exists())
+        held, _ = worktree.create(repo, "developer", "held")
+        worktree.keep(held)
+        check("reopen refuses when the run's branch is checked out in your checkout, and lets it go",
+              worktree.reopen(repo, "held", "my-work") is None
+              and not (sb.root / "worktrees" / "held.keep").exists())
+        worktree.remove(repo, held)
+        claimed, _ = worktree.create(repo, "developer", "claimed")
+        worktree.keep(claimed)
+        check("reopen claims a kept worktree: its marker goes, a crash leaves a plain orphan",
+              worktree.reopen(repo, "claimed") is not None
+              and not (sb.root / "worktrees" / "claimed.keep").exists())
+        worktree.remove(repo, claimed)
 
         # still_wanted leaves the PR head for the check above.
         brief = _brief(_write_brief(sb.root / "rf.md", {
@@ -2741,6 +3147,8 @@ def main() -> int:
         test_dispatch_caps,
         test_stage_a_enqueues_stage_b,
         test_pause_stops_dispatch_not_admission,
+        test_run_window_parsing,
+        test_run_window_stops_runs_not_reconciler,
         test_hardened_home_is_disposable,
         test_sentry_event_alert,
         test_dry_run_rows_come_back_live,
@@ -2764,6 +3172,7 @@ def main() -> int:
         test_backfill_skips_only_the_cutoff,
         test_service_map,
         test_stream_result_beats_exit_code,
+        test_usage_limit_parks_the_queue,
         test_anti_loop_marker,
         test_bmad_kit_is_ensured,
         test_stage_a_must_publish_its_review,

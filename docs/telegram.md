@@ -58,7 +58,7 @@ once at startup.
 | Command | What it does |
 | --- | --- |
 | `/run` | Runs one dispatch pass now |
-| `/status` | How many briefs are pending and failed, and how many issues wait for a release in each repo |
+| `/status` | How many briefs are pending and failed, how many issues wait for a release in each repo, and when the next try is after a Claude usage limit |
 | `/list` | Lists pending briefs with their priority |
 | `/brief` | Guided conversation that creates a brief from the chat |
 | `/logs` | Last 15 lines of `dispatch.log` |
@@ -70,7 +70,7 @@ once at startup.
 | Command | What it does |
 | --- | --- |
 | `/pause` | Kill switch. Everything is still admitted and recorded, but no run starts |
-| `/resume` | Lifts the pause |
+| `/resume` | Lifts the pause, and the Claude usage-limit wait |
 | `/events` | What came in. `/events rejected` shows what the filters dropped |
 | `/retry <id>` | Requeues a failed event |
 | `/reconcile` | Asks GitHub for what the webhook missed and runs the reconciler now |

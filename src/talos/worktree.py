@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +41,11 @@ WORKTREES_DIR = Path("~/.orchestrator/worktrees").expanduser()
 WORKSPACES_DIR = Path("~/.orchestrator/workspaces").expanduser()
 ADD_TIMEOUT = 300
 CONTAINER_PREFIX = "orq-"
+# A run parked by the Claude usage limit keeps its worktree for the resume:
+# `<WORKTREES_DIR>/<run>.keep` (outside the worktree, where the container
+# cannot write) holds its start commit. The sweep leaves it alone for this
+# long — the weekly limit is seven days — and then treats it as abandoned.
+KEEP_MAX_DAYS = 8
 
 
 class WorktreeError(RuntimeError):
@@ -329,12 +335,78 @@ def sweep_stale(repo: Path, git_dir: Path) -> list[Path]:
     directly, so a `locked` worktree (a `worktree add` that died halfway) is
     swept as well.
     """
-    stale = [path for _, path in _harness_worktrees(git_dir)]
+    stale = [path for _, path in _harness_worktrees(git_dir) if not _kept(path)]
     for path in stale:
         logger.warning("Orphan worktree from an earlier run: %s — deleting it", path)
         kill_container(CONTAINER_PREFIX + path.name)
         remove(repo, Worktree(path, git_dir))
     return stale
+
+
+def _keep_marker(path: Path) -> Path:
+    return WORKTREES_DIR / f"{path.name}.keep"
+
+
+def _kept(path: Path) -> bool:
+    """Is this worktree parked for a resume, and recently enough to wait for it?"""
+    try:
+        age = time.time() - _keep_marker(path).stat().st_mtime
+    except OSError:
+        return False
+    return age < KEEP_MAX_DAYS * 86400
+
+
+def keep(wt: Worktree) -> None:
+    """Parks the worktree: the next run of the same brief reopens it with `reopen`."""
+    _keep_marker(wt.path).write_text(wt.start + "\n")
+    logger.info("Worktree %s kept for the resume", wt.path)
+
+
+def is_kept(rid: str) -> bool:
+    """Is run `rid` parked with a worktree that a resume can still reopen?"""
+    path = _ours(WORKTREES_DIR / rid)
+    return path is not None and _kept(path)
+
+
+def release(rid: str) -> None:
+    """The parked run `rid` will not be resumed: its worktree becomes an
+    ordinary orphan, swept by the next `create` on the repo."""
+    path = _ours(WORKTREES_DIR / rid)
+    if path is not None:
+        _keep_marker(path).unlink(missing_ok=True)
+
+
+def reopen(repo: Path, rid: str, branch: str = "") -> Worktree | None:
+    """The worktree `keep` parked for run `rid`, or None if it cannot be reused.
+
+    It has to be ours, still registered in the repo's metadata, and pass the
+    same checks as `create` (repo config, `branch` not checked out in a
+    worktree of yours): otherwise the run starts from zero with a new
+    worktree. Reopening claims it whatever the outcome: the marker goes, so
+    a worktree that cannot be reused, or a resumed run that dies halfway, is
+    an ordinary orphan for the sweep, and a new park keeps it again.
+    """
+    path = _ours(WORKTREES_DIR / rid)
+    if path is None or not path.is_dir() or not _kept(path):
+        return None
+    marker = _keep_marker(path)
+    try:
+        start = marker.read_text().strip()
+        marker.unlink()
+        if unsafe_git_config(repo):
+            return None
+        r = host_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if r.returncode != 0:
+            return None
+        git_dir = Path(r.stdout.strip()).resolve()
+        if path not in [p for _, p in _harness_worktrees(git_dir)]:
+            return None
+        if branch and branch_holder(repo, branch):
+            return None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    logger.info("Reusing the kept worktree %s", path)
+    return Worktree(path, git_dir, start)
 
 
 def _force(func, path, _exc) -> None:
@@ -392,6 +464,7 @@ def remove(repo: Path, wt: Worktree) -> None:
         shutil.rmtree(path, **_RMTREE_ERR)
     if path.exists():
         logger.error("Could not fully delete %s — delete it by hand", path)
+    _keep_marker(path).unlink(missing_ok=True)
     for meta in metas:
         try:
             if meta.is_symlink():

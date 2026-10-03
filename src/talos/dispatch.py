@@ -23,7 +23,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -35,7 +35,8 @@ from talos import bmad_kit
 from talos import worktree
 from talos import secrets_env
 from talos.routing import resolve_gh_repo, resolve_sentry_project, validate_routing
-from talos.util import CONFIG_PATH, is_paused, slugify, utcnow
+from talos.util import (CONFIG_PATH, in_run_window, is_paused, local_now, parse_iso,
+                        parse_run_window, set_usage_limit, slugify, usage_limit_until, utcnow)
 
 # ── Module constants (also imported by bot.py) ───────────────────────────────
 
@@ -101,6 +102,25 @@ AGENT_HOMES_DIR = Path("~/.orchestrator/agent-home").expanduser()
 
 PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 MAX_INLINE_FILE_BYTES = 100 * 1024  # 100 KB
+# How a run that hit the Claude usage limit reads in the stream's `result`
+# event. The CLI's own list, lowercased, plus the older `…|<epoch>` form
+# and the API's bare 429 once the CLI has given up retrying it.
+USAGE_LIMIT_PREFIXES = (
+    "spending cap reached", "limit reached", "weekly limit", "session limit",
+    "opus weekly limit", "opus limit", "usage limit reached", "you've hit your",
+    "your rate limits will reset", "claude ai usage limit reached",
+    "api error: rate limit reached",
+)
+# Front matter of a parked brief: what the next run needs to pick it up
+# where it stopped. mark_running drops them from the file.
+RESUME_KEYS = ("resume_run_id", "resume_session_id")
+RESUME_PROMPT = (
+    "Your previous run of this task stopped because the Claude usage limit was "
+    "reached. The limit has reset: continue exactly where you stopped. Check the "
+    "state of the working tree, the branch and any PR before acting, do not "
+    "redo steps that are already done, and finish the task under the same "
+    "instructions and result contract as before."
+)
 # How often dispatch checks whether the run log grew. The silence threshold
 # is `stall_timeout_seconds` from the config.
 STALL_POLL_SECONDS = 30
@@ -229,6 +249,17 @@ def load_config() -> dict:
         # already copied.
         logger.warning("config.yaml: stall_timeout_seconds=%r is not an integer >= 0; using 1200", stall)
         cfg["stall_timeout_seconds"] = 1200
+
+    # Parsed once here so a bad window fails at startup, not at the first
+    # brief. The underscore marks it as derived, not a config.yaml key.
+    # `run_window:` with every child commented out loads as None; failing
+    # beats silently running at any hour.
+    if "run_window" in cfg and cfg["run_window"] is None:
+        raise SystemExit("config.yaml: run_window is empty; set start/end or remove the key")
+    try:
+        cfg["_run_window"] = parse_run_window(cfg.get("run_window"))
+    except ValueError as e:
+        raise SystemExit(f"config.yaml: {e}") from None
 
     # A badly written routing config has to fail here, not six hours
     # later when the first webhook arrives.
@@ -778,6 +809,83 @@ def effective_returncode(returncode: int, stream: dict | None) -> int:
     return returncode
 
 
+def _stream_events(run_log: Path):
+    """Every JSON event of a stream-json run log, skipping what does not parse."""
+    try:
+        with open(run_log, errors="replace") as f:
+            for line in f:
+                line = line.strip().strip("\r")
+                if not line.startswith("{"):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    yield obj
+    except OSError as e:
+        logger.warning("Could not read the run log %s: %s", run_log, e)
+
+
+def usage_limit_message(run_log: Path) -> str | None:
+    """The usage-limit message a run ended with, or None.
+
+    Only the final `result` event counts, and only with `is_error`: the CLI
+    sets that for its own API-error messages, never for text the agent
+    wrote, so an agent that ends with "Limit reached…" is not parked.
+    """
+    result = None
+    for obj in _stream_events(run_log):
+        if obj.get("type") == "result":
+            result = obj
+    if result is None or not result.get("is_error") or not isinstance(result.get("result"), str):
+        return None
+    text = result["result"].strip()
+    return text[:300] if text.lower().startswith(USAGE_LIMIT_PREFIXES) else None
+
+
+def run_did_work(run_log: Path) -> bool:
+    """Did the model answer at least once? A resume that hits the limit on
+    its first call only has the CLI's synthetic error message."""
+    return any(
+        obj.get("type") == "assistant"
+        and (obj.get("message") or {}).get("model") not in (None, "<synthetic>")
+        for obj in _stream_events(run_log)
+    )
+
+
+def read_session_id(run_log: Path) -> str:
+    """The Claude session id of the run, for `--resume`. '' if the log has none."""
+    session = ""
+    for obj in _stream_events(run_log):
+        if isinstance(obj.get("session_id"), str) and obj["session_id"]:
+            session = obj["session_id"]
+    return session
+
+
+def park_agent_home(home: Path) -> None:
+    """Keeps only the session transcripts (`.claude/projects`) for `--resume`.
+
+    The credentials copy, settings and whatever else the run wrote go, as
+    they would at the end of any run; prepare_agent_home rebuilds them when
+    the parked brief runs again with the same run id.
+    """
+    leftovers = [c for c in home.iterdir() if c.name != ".claude" or c.is_symlink()]
+    claude_dir = home / ".claude"
+    if claude_dir.is_dir() and not claude_dir.is_symlink():
+        leftovers += [c for c in claude_dir.iterdir() if c.name != "projects" or c.is_symlink()]
+    # Every one is tried, and whatever stays is raised: a credentials copy
+    # left in a parked home must not go unnoticed.
+    errors = []
+    for path in leftovers:
+        try:
+            _remove_path(path)
+        except OSError as e:
+            errors.append(str(e))
+    if errors:
+        raise OSError("; ".join(errors))
+
+
 # ── Running Claude in Docker ─────────────────────────────────────────────────
 
 
@@ -860,11 +968,39 @@ def run_claude_in_docker(
         lead_rendered = lead_rendered.replace("{" + key + "}", value)
     workspace.mkdir(parents=True, exist_ok=True)
     lead_path = workspace / ".lead-orchestrator.md"
+
+    # The branch the run is going to take: it cannot be checked out in your
+    # checkout (worktree.branch_holder). still_wanted left the PR's one here.
+    agent_branch = brief_slug if pipeline == "issue-fix" else str(meta.get("head_ref") or "")
+    # A brief parked by the usage limit carries the run id and session of the
+    # run that stopped. Reusing the run id puts the worktree and the agent
+    # home (and so the session transcript) at the same paths; without its
+    # worktree there is nothing to resume and the run starts from zero.
+    run_id = worktree.run_id(timestamp, brief_slug)
+    resume_rid = str(meta.get("resume_run_id") or "").strip()
+    resume_sid = str(meta.get("resume_session_id") or "").strip()
+    kept_wt = None
+    if resume_sid and hardened and resume_rid:
+        kept_wt = worktree.reopen(repo_path, resume_rid, agent_branch)
+        if kept_wt is None:
+            logger.warning("The worktree of the parked run %s is gone: %s starts from zero",
+                           resume_rid, brief.path.name)
+        else:
+            run_id = resume_rid
+    resuming = bool(resume_sid) and (not hardened or kept_wt is not None)
+    if resuming:
+        logger.info("Resuming session %s of %s", resume_sid, brief.path.name)
+
     result_path = workspace / ".orchestrator-result.json"
     plan_path = workspace / ".orchestrator-plan.md"
     # Clean up the previous ones (orphaned by an earlier run, or swapped for a
-    # directory by one, which would otherwise block every later run).
-    for leftover in (lead_path, result_path, plan_path):
+    # directory by one, which would otherwise block every later run). A
+    # resumed run keeps its plan, as long as it is still a plain file: it is
+    # the same run.
+    leftovers = [lead_path, result_path]
+    if not resuming or plan_path.is_symlink() or plan_path.is_dir():
+        leftovers.append(plan_path)
+    for leftover in leftovers:
         _remove_path(leftover)
     lead_path.write_text(lead_rendered)
 
@@ -874,10 +1010,6 @@ def run_claude_in_docker(
     host_ssh = Path.home() / ".ssh"
     gh_token = get_gh_token()
     origin_before = _git_origin(repo_path) if hardened else None
-    # The branch the run is going to take: it cannot be checked out in your
-    # checkout (worktree.branch_holder). still_wanted left the PR's one here.
-    agent_branch = brief_slug if pipeline == "issue-fix" else str(meta.get("head_ref") or "")
-    run_id = worktree.run_id(timestamp, brief_slug)
     container_name = f"orq-{run_id}"
 
     # Running the container as the host user keeps the files the agent
@@ -993,6 +1125,7 @@ def run_claude_in_docker(
     # No prompt in argv: `claude -p` reads it from stdin (see "-i" above).
     claude_args = [
         "claude", "-p",
+        *(["--resume", resume_sid] if resuming else []),
         "--append-system-prompt-file", "/workspace/.lead-orchestrator.md",
         "--dangerously-skip-permissions",
         # `claude -p` in text mode prints NOTHING until the final message, so
@@ -1002,9 +1135,11 @@ def run_claude_in_docker(
         # measure.
         "--output-format", "stream-json", "--verbose",
     ]
-    if hardened:
+    if hardened and kept_wt is None:
         # The worktree was created with --no-checkout: the checkout runs here,
         # in the container, with whatever filters and LFS the repo has, not on the host.
+        # A kept worktree is already checked out, with the parked run's
+        # uncommitted work in it: a reset would throw that away.
         cmd += ["sh", "-c", 'git -C "/workspace/$SUBREPO" reset --hard --quiet </dev/null && exec '
                 + " ".join(shlex.quote(a) for a in claude_args)]
     else:
@@ -1023,10 +1158,12 @@ def run_claude_in_docker(
     pr_data: dict = {"prs": [], "summary": "", "status": "ok", "iterations": 0, "blockers": []}
     timed_out = False
     container_exited = False
+    parked = False
     wt = None
     try:
         if hardened:
-            wt, why = worktree.create(repo_path, base_branch, run_id, agent_branch)
+            wt, why = (kept_wt, "") if kept_wt is not None else worktree.create(
+                repo_path, base_branch, run_id, agent_branch)
             if wt is None:
                 raise worktree.WorktreeError(why)
             # The worktree's .git points to the repo's git dir with an absolute
@@ -1044,7 +1181,7 @@ def run_claude_in_docker(
         # An anonymous file (no name on disk, gone when closed) rather than a
         # pipe: nobody has to keep feeding it while the run is watched.
         with open(run_log, "w") as f, tempfile.TemporaryFile("w+", encoding="utf-8") as prompt_in:
-            prompt_in.write(prompt)
+            prompt_in.write(RESUME_PROMPT if resuming else prompt)
             prompt_in.flush()
             prompt_in.seek(0)
             f.write(f"# Run: {project_name} @ {datetime.now().isoformat()}\n\n")
@@ -1105,6 +1242,28 @@ def run_claude_in_docker(
                 project_name, pipeline,
             )
             returncode = effective_returncode(returncode, stream)
+
+        limit = usage_limit_message(run_log) if returncode != 0 and container_exited else None
+        if limit:
+            # Not a failure of the work: the brief is parked (process_brief)
+            # and this run is resumed once the limit resets. Its worktree,
+            # session and plan stay; nothing it left is read as a result.
+            logger.warning("Claude usage limit reached in %s [pipeline=%s]: %s",
+                           project_name, pipeline, limit)
+            session = read_session_id(run_log) or resume_sid
+            # Without a session there is nothing to resume: the brief still
+            # waits, but its worktree and agent home go as after any run.
+            parked = bool(session)
+            pr_data["status"] = "usage_limit"
+            pr_data["summary"] = limit
+            pr_data["did_work"] = run_did_work(run_log)
+            pr_data["resume"] = {
+                # Only a kept worktree can be reopened; a run without one
+                # resumes its session in place.
+                "run_id": run_id if wt is not None and parked else "",
+                "session_id": session,
+            }
+            return returncode, run_log, pr_data
 
         if pipeline in STRICT_RESULT_PIPELINES:
             # The failure propagates as pr_data["status"], not as an exception,
@@ -1179,13 +1338,23 @@ def run_claude_in_docker(
                      project_path, subrepo, ro_siblings)
         if finish_home is not None:
             _cleanup(interrupted, "write back the agent credentials", finish_home)
+        # A run parked by the usage limit keeps its worktree, its session
+        # transcripts and its plan for the resume. If the worktree cannot be
+        # kept there is nothing to resume, and everything goes as usual.
+        if wt is not None and parked:
+            _cleanup(interrupted, "keep the worktree for the resume", worktree.keep, wt)
+            parked = worktree.is_kept(wt.path.name)
         if agent_home is not None:
-            _cleanup(interrupted, "delete the agent home", _remove_path, agent_home)
-        if wt is not None:
+            if parked:
+                _cleanup(interrupted, "prune the parked agent home", park_agent_home, agent_home)
+            else:
+                _cleanup(interrupted, "delete the agent home", _remove_path, agent_home)
+        if wt is not None and not parked:
             _cleanup(interrupted, "remove the worktree", worktree.remove, repo_path, wt)
         _cleanup(interrupted, "delete .lead-orchestrator.md", _remove_path, lead_path)
         _cleanup(interrupted, "delete the result file", _remove_path, result_path)
-        _cleanup(interrupted, "delete the plan file", _remove_path, plan_path)
+        if not parked:
+            _cleanup(interrupted, "delete the plan file", _remove_path, plan_path)
         if interrupted:
             raise interrupted[0]
 
@@ -1274,8 +1443,74 @@ def mark_running(brief: Brief) -> None:
     find_pending_briefs() only picks up `pending` ones, so this keeps a crash
     or a reboot mid-run from making the next pass blindly re-run it against
     a branch that may already exist and a PR that may already be open.
+
+    The resume data of a parked brief is dropped from the file here: this
+    run already has it in memory, and only a new park writes it again.
     """
+    post = frontmatter.load(brief.path)
+    for key in RESUME_KEYS:
+        post.metadata.pop(key, None)
+    brief.path.write_text(frontmatter.dumps(post))
     mark_state(brief, "running", {"started_at": datetime.now().isoformat()})
+
+
+def park_brief(config: dict, brief: Brief, pr_data: dict, run_log: Path | None) -> dict:
+    """The run hit the Claude usage limit: the brief waits, it did not fail.
+
+    It goes back to `pending` with what the next run needs to resume it, the
+    ledger row goes back to `admitted` (as /retry leaves it), and USAGE_LIMIT
+    holds every run for `usage_limit_retry_minutes`. No comment on the
+    source and no `failed`: nothing went wrong with the work. Telegram hears
+    about a new limit hit, not about every hourly attempt that finds the
+    limit still there.
+
+    A brief first parked longer than worktree.KEEP_MAX_DAYS ago fails
+    instead: past the weekly limit it is not waiting for quota, and a stream
+    that keeps claiming a limit must not hold the queue forever.
+    """
+    resume = pr_data.get("resume") or {}
+    reason = f"usage_limit: {pr_data.get('summary') or ''}"[:500]
+    now = datetime.now(timezone.utc)
+    since = parse_iso(str(brief.metadata.get("usage_limit_since") or "")) or now
+    if now - since > timedelta(days=worktree.KEEP_MAX_DAYS):
+        worktree.release(str(resume.get("run_id") or ""))
+        return _fail(config, brief, f"{reason} (parked since {since:%Y-%m-%d}, giving up)",
+                     run_log, pr_data)
+    hits = int(brief.metadata.get("usage_limit_hits") or 0) + 1
+    post = frontmatter.load(brief.path)
+    post.metadata["status"] = "pending"
+    post.metadata.pop("started_at", None)
+    post.metadata["usage_limit_hits"] = hits
+    post.metadata["usage_limit_since"] = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+    post.metadata["last_error"] = reason
+    for key, value in (("resume_run_id", resume.get("run_id")),
+                       ("resume_session_id", resume.get("session_id"))):
+        if value:
+            post.metadata[key] = value
+        else:
+            post.metadata.pop(key, None)
+    brief.path.write_text(frontmatter.dumps(post))
+
+    minutes = int(config.get("usage_limit_retry_minutes", 60))
+    until = now + timedelta(minutes=minutes)
+    set_usage_limit(until)
+    logger.warning("Brief %s parked by the Claude usage limit (attempt %d); next try at %s",
+                   brief.path.name, hits, until.astimezone().strftime("%H:%M"))
+
+    event_id = brief.metadata.get("event_id")
+    if event_id:
+        try:
+            from talos import store
+
+            with store.connect() as conn:
+                store.set_state(conn, int(event_id), "admitted", last_error=reason, claimed_at=None)
+        except Exception as e:
+            logger.warning("Could not park event %s in the ledger: %s", event_id, e)
+    # A run that got answers before the limit is a new hit; one that did not
+    # is an hourly retry that found the limit still there.
+    if hits == 1 or pr_data.get("did_work"):
+        notify_telegram(config, brief.path.name, brief.project, "usage_limit", run_log, pr_data)
+    return {"brief": brief, "status": "usage_limit", "pr_data": pr_data}
 
 
 def mark_pr_open(brief: Brief, vault: str, pr_data: dict) -> Path:
@@ -1469,6 +1704,7 @@ def notify_telegram(
         "merged": "🎉",
         "merged_dev": "📦",
         "human_review": "👀",
+        "usage_limit": "⏸️",
     }.get(status, "❌")
     last_lines = ""
     if run_log_path is not None:
@@ -1701,8 +1937,35 @@ def enrich_sentry_brief(config: dict, brief: Brief) -> str:
     return ""
 
 
+def release_parked(brief: Brief) -> None:
+    """A parked brief that closes without resuming lets go of its kept
+    worktree: the next `create` on the repo sweeps it, and its agent home
+    goes in the next pass's sweep_agent_homes."""
+    rid = str(brief.metadata.get("resume_run_id") or "").strip()
+    if rid:
+        worktree.release(rid)
+
+
+def sweep_agent_homes() -> None:
+    """Deletes the agent homes no parked run can resume.
+
+    Only with the pass lock held: a live run's home has no keep marker
+    either. A parked run's home holds only session transcripts, and those
+    must not outlive the park.
+    """
+    try:
+        homes = list(AGENT_HOMES_DIR.iterdir()) if AGENT_HOMES_DIR.is_dir() else []
+    except OSError:
+        return
+    for home in homes:
+        if not worktree.is_kept(home.name):
+            logger.info("Agent home with nothing to resume: %s — deleting it", home)
+            shutil.rmtree(home, ignore_errors=True)
+
+
 def skip_brief(config: dict, brief: Brief, reason: str, gate: str) -> dict:
     """The brief no longer applies: it leaves ToDos/ without running, with the reason."""
+    release_parked(brief)
     new_path = mark_state(
         brief, "skipped",
         {"skipped_at": datetime.now().isoformat(), "skip_reason": reason},
@@ -1884,6 +2147,7 @@ def _fail(config: dict, brief: Brief, reason: str, run_log: Path | None,
     ≠ 0 or a timeout left the row in `running` until the reaper marked it
     `orphaned` — with a misleading reason — and the issue got no notice.
     """
+    release_parked(brief)
     mark_failed(brief, reason, pr_data)
     record_event_state(config, brief, "failed", pr_data, error=reason)
     try:
@@ -1970,6 +2234,8 @@ def process_brief(brief: Brief, config: dict, dry_run: bool) -> dict | None:
         return _fail(config, brief, f"docker error: {e}", None, {"prs": []})
 
     status = str(pr_data.get("status") or "ok").strip().lower()
+    if status == "usage_limit":
+        return park_brief(config, brief, pr_data, run_log)
     if returncode == 0 and status == "aborted_max_iterations":
         # The architect ran fine but aborted the brief for not converging.
         alert_iteration_cap(brief, pr_data)
@@ -2237,11 +2503,13 @@ def reap_running_briefs(config: dict) -> None:
                 logger.warning("Could not mark the orphaned event %s: %s", event_id, e)
 
 
-def run_once(config: dict, dry_run: bool = False) -> int:
+def run_once(config: dict, dry_run: bool = False, ignore_schedule: bool = False) -> int:
     """
     Full pipeline: find pending, sort, process.
     Returns the number of briefs processed (0 if locked by another pass in
     progress).
+
+    `ignore_schedule` lets this pass start runs outside `run_window`.
     """
     if dry_run:
         briefs = sort_by_priority(
@@ -2270,6 +2538,7 @@ def run_once(config: dict, dry_run: bool = False) -> int:
         # With the lock held there is no run in progress: a live `orq-*` is
         # from a dispatch that died halfway.
         worktree.kill_orphan_containers()
+        sweep_agent_homes()
         reap_running_briefs(config)
         reap_stale_events(config)
         run_reconciler(config)
@@ -2277,17 +2546,21 @@ def run_once(config: dict, dry_run: bool = False) -> int:
         results: list[dict] = []
         seen: set[Path] = set()
         processed = 0
-        paused = False
+        halted = False  # PAUSED or outside the run window
         # Rescan when the batch ends: stage A enqueues review-fix round 1
         # (and the webhook keeps admitting) during the pass, and webhookd
         # cannot kick a pass that already holds the lock.
-        while not paused:
-            briefs = [
-                b for b in sort_by_priority(
+        while not halted:
+            # A brief parked by the usage limit goes first: it is the
+            # hourly check of whether the limit reset, and its kept
+            # worktree must not wait behind fresh runs.
+            briefs = sorted(
+                (b for b in sort_by_priority(
                     find_pending_briefs(config["vault"], config["briefs_dir"])
-                )
-                if b.path not in seen
-            ]
+                ) if b.path not in seen),
+                key=lambda b: not b.metadata.get("resume_run_id")
+                and not b.metadata.get("resume_session_id"),
+            )
             if not briefs:
                 break
             logger.info("Found %d pending brief(s)", len(briefs))
@@ -2299,26 +2572,52 @@ def run_once(config: dict, dry_run: bool = False) -> int:
                 if is_paused():
                     logger.warning("PAUSED appeared mid-pass — not starting "
                                    "%s or the ones after it", b.path.name)
-                    paused = True
+                    halted = True
                     break
-                verdict = cap_verdict(config, b)
-                if not verdict.admitted:
+                # Same spot and same reason as PAUSED: a pass that crosses
+                # the end of the window stops starting runs. The briefs stay
+                # `pending` for the first pass after the window opens; a run
+                # already going is left to finish.
+                window = config.get("_run_window")
+                if not ignore_schedule and not in_run_window(window):
+                    logger.info("Outside the run window (%s, now %s) — not starting "
+                                "%s or the ones after it", window.describe(),
+                                local_now(window).strftime("%H:%M"), b.path.name)
+                    halted = True
+                    break
+                # A run already hit the Claude usage limit: starting more
+                # only fails them. The marker lifts itself.
+                until = usage_limit_until()
+                if until is not None:
+                    logger.info("Claude usage limit: next try at %s — not starting "
+                                "%s or the ones after it",
+                                until.astimezone().strftime("%H:%M"), b.path.name)
+                    halted = True
+                    break
+                # A parked brief already passed the caps when it first ran,
+                # and its own open PR must not count against its resume.
+                parked = b.metadata.get("resume_run_id") or b.metadata.get("resume_session_id")
+                verdict = None if parked else cap_verdict(config, b)
+                if verdict is not None and not verdict.admitted:
                     defer_brief(config, b, verdict)
                     continue
                 res = process_brief(b, config, dry_run=False)
                 processed += 1
                 if res is not None:
                     results.append(res)
+                    if res.get("status") == "usage_limit":
+                        halted = True
+                        break
         log_pass_summary(results)
         return processed
 
 
-def watch_loop(config: dict) -> None:
+def watch_loop(config: dict, ignore_schedule: bool = False) -> None:
     interval = int(config.get("poll_interval_seconds", 300))
     logger.info("Watch mode started, polling every %ds", interval)
     try:
         while True:
-            run_once(config, dry_run=False)
+            run_once(config, dry_run=False, ignore_schedule=ignore_schedule)
             time.sleep(interval)
     except KeyboardInterrupt:
         logger.info("Watch mode stopped by the user.")
@@ -2337,6 +2636,8 @@ def main() -> None:
                         help="Show what it would do without invoking Docker or moving files.")
     parser.add_argument("--once", action="store_true",
                         help="Single pass (default).")
+    parser.add_argument("--ignore-schedule", action="store_true",
+                        help="Start runs even outside run_window (config.yaml).")
     args = parser.parse_args()
 
     setup_logging()
@@ -2344,9 +2645,9 @@ def main() -> None:
     check_prereqs(config, dry_run=args.dry_run)
 
     if args.watch:
-        watch_loop(config)
+        watch_loop(config, ignore_schedule=args.ignore_schedule)
     else:
-        run_once(config, dry_run=args.dry_run)
+        run_once(config, dry_run=args.dry_run, ignore_schedule=args.ignore_schedule)
 
 
 if __name__ == "__main__":

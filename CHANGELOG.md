@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A run that hits the Claude usage limit is parked instead of failed: its
+  brief goes back to `pending`, no run starts for `usage_limit_retry_minutes`
+  (default 60), and the retry resumes the same Claude session in the same
+  worktree. `/resume` lifts the wait and `/status` shows it.
+
 ### Security
 
 - `GH_TOKEN` goes to `docker run` by name only, and the prompt goes in on

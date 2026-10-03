@@ -67,7 +67,7 @@ Four processes, all Python, all running from one checkout:
 | `bmad_kit.py` | Detects, installs (pinned `bmad-method`) and syncs the headless overrides |
 | `sentry_api.py` | Fetches the Sentry issue and latest event over REST at dispatch time |
 | `secrets_env.py` | Loads `~/.orchestrator/secrets.env` and resolves secret names from config |
-| `util.py` | Config path (`TALOS_CONFIG`), pause sentinel, slugs, time helpers |
+| `util.py` | Config path (`TALOS_CONFIG`), pause sentinel, run window, slugs, time helpers |
 | `bot.py` | Telegram commands and the `/brief` conversation |
 | `prompts/` | System prompts: `lead-orchestrator.md` (manual briefs), `lead-issue-fix.md`, `lead-review-fix.md` |
 | `bmad-kit/` | `_bmad/custom/` overrides: `bmad-quick-dev.toml`, `bmad-code-review.toml`, `headless-contract.md`, `headless-complete.md` |
@@ -120,11 +120,12 @@ Everything the harness owns lives in `~/.orchestrator/`:
 | `logs/dispatch.log` | The general log (rotated) |
 | `logs/runs/<timestamp>-<project>.log` | One stream-json log per run |
 | `logs/plans/` | Archived swarm plans (`.orchestrator-plan.md`) |
-| `worktrees/<run>` | Per-run git worktrees (deleted when the run ends) |
+| `worktrees/<run>` | Per-run git worktrees (deleted when the run ends; kept with a `<run>.keep` marker while a run is parked by the usage limit) |
 | `workspaces/<project>` | BMAD workspaces for projects without `subrepo` |
 | `agent-home/` | Throwaway `~/.claude` folders for hardened runs |
 | `secrets.env` | Secrets, mode 0600 |
 | `PAUSED` | The kill switch sentinel |
+| `USAGE_LIMIT` | When the next run may start after a Claude usage-limit hit |
 | `dispatch.lock` | The pass flock |
 | `last-reconcile` | Timestamp of the last reconciler pass |
 
