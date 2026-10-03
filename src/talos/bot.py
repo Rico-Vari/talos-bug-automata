@@ -49,7 +49,7 @@ from talos.dispatch import (
     run_once,
     setup_logging,
 )
-from talos.util import PAUSED_FILE, slugify
+from talos.util import PAUSED_FILE, clear_usage_limit, slugify, usage_limit_until
 
 # The only thing /retry can revive: a run that ended badly and whose brief
 # is still in ToDos/ (mark_failed does not move it).
@@ -144,6 +144,10 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"⏳ Pending: {len(pending)}\n"
         f"❌ Failed:  {len(failed)}\n"
     )
+    until = usage_limit_until()
+    if until is not None:
+        text += (f"⏸ Claude usage limit: next try at {until.astimezone():%H:%M} "
+                 "(`/resume` to try now)\n")
     if failed:
         names = "\n".join(f"  • `{f.stem}`" for f in failed[:5])
         text += f"\n*Failed (first 5):*\n{names}"
@@ -407,10 +411,16 @@ async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lifts /pause and the Claude usage-limit wait. With the wait gone, the
+    next pass tries the parked brief now instead of at the hourly check."""
     sentinel = Path(PAUSED_FILE).expanduser()
-    if sentinel.exists():
+    paused = sentinel.exists()
+    if paused:
         sentinel.unlink()
-        await update.message.reply_text("▶️ Harness resumed.")
+    limited = clear_usage_limit()
+    if paused or limited:
+        await update.message.reply_text(
+            "▶️ Harness resumed." + (" The usage-limit wait is lifted." if limited else ""))
     else:
         await update.message.reply_text("The harness was not paused.")
 
@@ -505,6 +515,9 @@ async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             post.metadata["status"] = "pending"
             post.metadata.pop("last_error", None)
             post.metadata.pop("started_at", None)
+            # A retry starts from zero, not from a session parked by the usage limit.
+            for key in ("resume_run_id", "resume_session_id", "usage_limit_hits", "usage_limit_since"):
+                post.metadata.pop(key, None)
             brief_path.write_text(frontmatter.dumps(post))
             store.set_state(conn, event_id, "admitted", last_error=None, claimed_at=None)
     except Exception as e:

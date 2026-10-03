@@ -97,6 +97,7 @@ The main keys:
 | `docker_image` | Image to run (default `claude-dev`) |
 | `claude_timeout_seconds` | Timeout for a manual brief |
 | `stall_timeout_seconds` | Cut a run whose log has not grown for this long (default 1200, `0` disables) |
+| `usage_limit_retry_minutes` | After a run hits the Claude usage limit, wait this long before trying again (default 60). See [event-harness.md](event-harness.md#claude-usage-limit) |
 | `max_iterations` | Fix-and-revalidate rounds the swarm architect may run before it aborts a manual brief |
 | `projects` | Allowlist of local project paths, `name: path` |
 | `run_window` | Optional hours when Claude runs may start. See [Run window](#run-window) |
