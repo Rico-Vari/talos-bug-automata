@@ -49,6 +49,7 @@ from talos.dispatch import (
     run_once,
     setup_logging,
 )
+from talos import secrets_env
 from talos.util import PAUSED_FILE, clear_usage_limit, slugify, usage_limit_until
 
 # The only thing /retry can revive: a run that ended badly and whose brief
@@ -652,9 +653,10 @@ async def cmd_reconcile(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main() -> None:
     setup_logging()
-    token = CONFIG.get("telegram_bot_token", "")
+    token = secrets_env.telegram_token(CONFIG)
     if not token:
-        raise SystemExit("telegram_bot_token is not set in config.yaml")
+        raise SystemExit("No Telegram token: set secrets.telegram_bot_token_env in config.yaml "
+                         f"and the variable in {secrets_env.SECRETS_FILE}")
 
     app = Application.builder().token(token).build()
 

@@ -25,7 +25,8 @@ running the processes as systemd user services.
 - `~/.ssh/` with your key, so the agent can `git push` from manual-brief
   containers. This one is a warning, not an error.
 - `gh` authenticated on the host (`gh auth login`). Dispatch reads
-  `gh auth token` and passes it into the container as `GH_TOKEN`. Without it
+  `gh auth token` and passes it into the container as `GH_TOKEN` (by name
+  only, so it never shows up in `ps`). Without it
   the agent can still commit, and push over SSH on manual briefs, but it can't
   open PRs.
 - Node.js with `npx`, for the event harness. Dispatch runs the BMAD installer
@@ -93,7 +94,7 @@ The main keys:
 | `briefs_dir` | Brief queue folder inside the vault (default `ToDos`) |
 | `memory_dir` | Agent memory folder inside the vault |
 | `poll_interval_seconds` | Poll interval for `talos-dispatch --watch` |
-| `telegram_bot_token`, `telegram_chat_id` | See [telegram.md](telegram.md) |
+| `telegram_chat_id` | See [telegram.md](telegram.md). The token itself goes in `secrets.env` (`secrets.telegram_bot_token_env`) |
 | `docker_image` | Image to run (default `claude-dev`) |
 | `claude_timeout_seconds` | Timeout for a manual brief |
 | `stall_timeout_seconds` | Cut a run whose log has not grown for this long (default 1200, `0` disables) |
@@ -343,7 +344,7 @@ systemctl --user enable --now talos-bot     # enable and start now
    - `telegram_chat_id` not configured: fill in the field in `config.yaml`.
    - `ModuleNotFoundError`: the venv is missing dependencies. Run
      `./venv/bin/pip install -e .`.
-   - `telegram.error.InvalidToken`: the token in `config.yaml` is wrong.
+   - `telegram.error.InvalidToken`: the token in `secrets.env` is wrong.
 3. Run the process by hand to see the error without systemd in the way:
 
    ```bash

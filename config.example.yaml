@@ -10,8 +10,9 @@ briefs_dir: ToDos              # brief inbox, relative to the vault
 memory_dir: agentes/memoria    # per-project agent memory, relative to the vault
 poll_interval_seconds: 300
 
-# Telegram bot — create it with @BotFather and get chat_id from /getUpdates
-telegram_bot_token: ""   # e.g. 123456:ABC-DEF...  (empty = no notifications)
+# Telegram bot — create it with @BotFather and get chat_id from /getUpdates.
+# The token is a secret: it goes in secrets.env, named by
+# secrets.telegram_bot_token_env below (unset = no notifications).
 telegram_chat_id: ""     # e.g. 987654321
 
 # Auth: manual briefs mount the host's ~/.claude (run `claude` interactively
@@ -160,6 +161,8 @@ secrets:
   # instead of mounting the host's ~/.claude. Without it, they use a copy of
   # ~/.claude/.credentials.json.
   claude_oauth_token_env: CLAUDE_CODE_OAUTH_TOKEN
+  # Telegram bot token (from @BotFather). Optional.
+  telegram_bot_token_env: TELEGRAM_BOT_TOKEN
 
 # Per-pipeline timeout in seconds (falls back to claude_timeout_seconds).
 timeouts:
