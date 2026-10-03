@@ -435,6 +435,112 @@ def test_pause_stops_dispatch_not_admission() -> None:
         check("a /pause halfway through the pass stops the ones that follow", len(calls) == 1, str(calls))
 
 
+def test_run_window_parsing() -> None:
+    """D3b: run_window parses, rejects bad input and handles midnight."""
+    print("\nD3b — run_window parsing and edges")
+    from datetime import datetime, timezone
+
+    from talos.util import in_run_window, parse_run_window
+
+    cancun = parse_run_window({"timezone": "America/Cancun", "start": "19:00", "end": "06:00"})
+    check("no block means always on", parse_run_window(None) is None and in_run_window(None))
+
+    def at(hh: int, mm: int = 0) -> datetime:
+        # Cancun is UTC-5 all year (no DST since 2015).
+        return datetime(2026, 10, 3, (hh + 5) % 24, mm, tzinfo=timezone.utc)
+
+    check("23:30 Cancun is inside", in_run_window(cancun, at(23, 30)))
+    check("02:00 Cancun is inside", in_run_window(cancun, at(2)))
+    check("14:00 Cancun is outside", not in_run_window(cancun, at(14)))
+    check("19:00 is inclusive", in_run_window(cancun, at(19)))
+    check("06:00 is exclusive", not in_run_window(cancun, at(6)))
+    check("05:59 is inside", in_run_window(cancun, at(5, 59)))
+    # 20:00 UTC would be inside unconverted; in Cancun it is 15:00.
+    check("a UTC clock is converted to the window's zone",
+          not in_run_window(cancun, datetime(2026, 10, 3, 20, 0, tzinfo=timezone.utc)))
+
+    day = parse_run_window({"timezone": "UTC", "start": "09:00", "end": "17:00"})
+    check("same-day window: 12:00 inside",
+          in_run_window(day, datetime(2026, 10, 3, 12, tzinfo=timezone.utc)))
+    check("same-day window: 17:00 outside",
+          not in_run_window(day, datetime(2026, 10, 3, 17, tzinfo=timezone.utc)))
+
+    local = parse_run_window({"start": "19:00", "end": "06:00"})
+    check("no timezone means system local time", local.tz is None)
+    check("empty timezone means system local time",
+          parse_run_window({"start": "19:00", "end": "06:00", "timezone": ""}).tz is None)
+
+    # PyYAML reads an unquoted 19:00 as the sexagesimal int 1140.
+    import yaml
+    unquoted = parse_run_window(yaml.safe_load("start: 19:00\nend: 06:00\ntimezone: America/Cancun"))
+    check("unquoted YAML times parse",
+          (unquoted.start.hour, unquoted.end.hour) == (19, 6), str(unquoted))
+
+    for bad in ({"start": "19:00", "end": "06:00", "timezone": "Mars/Base"},
+                {"start": "25:00", "end": "06:00"},
+                {"start": "07:00", "end": "07:00"},
+                {"start": "19:00"},
+                {"end": "06:00"},
+                {"start": True, "end": "06:00"},
+                {"start": 19, "end": 6},
+                {"start": "19:00", "end": "06:00", "tz": "America/Cancun"},
+                {"start": "19:00", "end": "06:00", "timezone": 0},
+                {"start": "19:00", "end": "06:00", "timezone": "America"},
+                ["19:00", "06:00"]):
+        try:
+            parse_run_window(bad)
+            check(f"rejects {bad!r}", False, "no error")
+        except ValueError:
+            check(f"rejects {bad!r}", True)
+
+
+def test_run_window_stops_runs_not_reconciler() -> None:
+    """D3c: outside the window, no run starts but the reconciler still runs."""
+    print("\nD3c — run_window = no runs, reconciler goes on")
+    from datetime import datetime, timezone
+
+    import frontmatter
+
+    from talos import dispatch
+    from talos.util import parse_run_window
+
+    with Sandbox() as sb:
+        for name in ("a.md", "b.md"):
+            _write_brief(sb.vault / "ToDos" / name, {"project": "sandbox", "status": "pending"})
+
+        afternoon = datetime(2026, 10, 3, 20, 0, tzinfo=timezone.utc)  # 15:00 Cancun
+        night = datetime(2026, 10, 4, 3, 0, tzinfo=timezone.utc)       # 22:00 Cancun
+
+        def run(clock: datetime | list, ignore_schedule: bool = False) -> tuple[list, list]:
+            calls, reconciled = [], []
+            clocks = iter(clock) if isinstance(clock, list) else None
+            cfg = sb.cfg()
+            cfg["_run_window"] = parse_run_window(
+                {"timezone": "America/Cancun", "start": "19:00", "end": "06:00"})
+            real = dispatch.in_run_window
+            with patched(dispatch, "is_paused", lambda: False), \
+                 patched(dispatch, "in_run_window",
+                         lambda w: real(w, next(clocks) if clocks else clock)), \
+                 patched(dispatch, "run_reconciler", lambda c: reconciled.append(1)), \
+                 patched(dispatch, "process_brief", lambda b, c, dry_run: calls.append(b.path.name)), \
+                 patched(dispatch, "LOCK_FILE", sb.root / "dispatch.lock"):
+                dispatch.run_once(cfg, ignore_schedule=ignore_schedule)
+            return calls, reconciled
+
+        calls, reconciled = run(afternoon)
+        check("outside the window no brief runs", calls == [], str(calls))
+        check("outside the window the reconciler still runs", reconciled == [1])
+        check("and the briefs stay pending",
+              all(frontmatter.load(p).metadata.get("status") == "pending"
+                  for p in (sb.vault / "ToDos").glob("*.md")))
+        calls, _ = run(night)
+        check("the first pass inside the window picks them up", len(calls) == 2, str(calls))
+        calls, _ = run(afternoon, ignore_schedule=True)
+        check("--ignore-schedule runs them anyway", len(calls) == 2, str(calls))
+        calls, _ = run([night, afternoon])
+        check("a window that closes mid-pass stops the ones that follow", len(calls) == 1, str(calls))
+
+
 def test_hardened_home_is_disposable() -> None:
     """D4: the hardened container does not see the host's settings, hooks or MCP."""
     print("\nD4 — disposable ~/.claude")
@@ -2572,6 +2678,8 @@ def main() -> int:
         test_dispatch_caps,
         test_stage_a_enqueues_stage_b,
         test_pause_stops_dispatch_not_admission,
+        test_run_window_parsing,
+        test_run_window_stops_runs_not_reconciler,
         test_hardened_home_is_disposable,
         test_sentry_event_alert,
         test_dry_run_rows_come_back_live,

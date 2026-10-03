@@ -34,6 +34,18 @@ stall_timeout_seconds: 1200
 # converge; lower it if you want the system to escalate to a human sooner.
 max_iterations: 3
 
+# Run window: Claude runs start only inside it. Outside it, dispatch starts
+# no new run (like /pause), but the reconciler and webhookd keep admitting
+# and the briefs wait in `pending` until the window opens. A run already
+# going when the window closes is left to finish. `start` is inclusive, `end`
+# exclusive; start > end crosses midnight. `timezone` is an IANA name; leave
+# it empty to use the system's local time. Quote the times. Remove the block
+# to run at any hour. `talos-dispatch --ignore-schedule` bypasses it.
+# run_window:
+#   timezone: America/Cancun
+#   start: "19:00"
+#   end: "06:00"
+
 # Local project folders: the allowlist of paths the agent may work in.
 # A project can be a single repo, or a parent folder holding several repos.
 projects:
