@@ -541,6 +541,37 @@ the next one. `/resume` runs whatever piled up, with nothing extra to do. If
 pausing stopped admission instead, whatever arrived during the pause would be
 lost, because the reconciler skips rows it already knows.
 
+### Claude usage limit
+
+A run that ends because the Claude usage limit was reached (the final message
+of the run's stream says so) is not a failure. dispatch parks it instead:
+
+- The brief goes back to `pending` with `resume_run_id` and
+  `resume_session_id`, and its ledger row goes back to `admitted`. Nothing is
+  posted on the issue. Telegram gets one ⏸️ notice on the first park.
+- `~/.orchestrator/USAGE_LIMIT` holds the time of the next attempt, now plus
+  `usage_limit_retry_minutes` (default 60). Until then no run starts; the
+  current pass stops and the rest of the queue stays `pending`. Webhooks and
+  the reconciler go on.
+- The run's worktree stays (marked by `worktrees/<run>.keep`), with whatever
+  the agent had not committed, and so does its session transcript in
+  `agent-home/<run>/.claude/projects`. Everything else in that agent home is
+  deleted as usual.
+- After the wait, the parked brief runs first, without going through the
+  load caps again (its own open PR would otherwise block it). It reuses the
+  worktree without a `reset --hard` and runs `claude -p --resume <session>`
+  with a "continue where you stopped" prompt. If the limit is still there, it
+  parks again for another hour, without a new Telegram notice.
+
+Only the CLI's own error result counts as the limit (`is_error` with one of
+its limit messages), so an agent that writes "limit reached" is not parked.
+If the kept worktree cannot be reused, the brief starts from zero. A brief
+that closes without resuming (skipped, failed) releases its worktree, and an
+agent home with nothing left to resume is deleted at the start of the next
+pass. A brief first parked more than eight days ago fails on its next limit
+hit. `/resume` lifts the wait to try now, and `/status` shows when the next
+try is.
+
 ### Where to see what's happening
 
 There is no web UI.

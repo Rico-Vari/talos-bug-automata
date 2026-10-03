@@ -120,11 +120,12 @@ Everything the harness owns lives in `~/.orchestrator/`:
 | `logs/dispatch.log` | The general log (rotated) |
 | `logs/runs/<timestamp>-<project>.log` | One stream-json log per run |
 | `logs/plans/` | Archived swarm plans (`.orchestrator-plan.md`) |
-| `worktrees/<run>` | Per-run git worktrees (deleted when the run ends) |
+| `worktrees/<run>` | Per-run git worktrees (deleted when the run ends; kept with a `<run>.keep` marker while a run is parked by the usage limit) |
 | `workspaces/<project>` | BMAD workspaces for projects without `subrepo` |
 | `agent-home/` | Throwaway `~/.claude` folders for hardened runs |
 | `secrets.env` | Secrets, mode 0600 |
 | `PAUSED` | The kill switch sentinel |
+| `USAGE_LIMIT` | When the next run may start after a Claude usage-limit hit |
 | `dispatch.lock` | The pass flock |
 | `last-reconcile` | Timestamp of the last reconciler pass |
 

@@ -26,6 +26,12 @@ claude_timeout_seconds: 5400
 # considered frozen and cut like a timeout (rc 124, container killed),
 # without waiting for the pipeline timeout. 0 turns it off.
 stall_timeout_seconds: 1200
+# Claude usage limit: a run that hits it is parked, not failed. Its brief
+# goes back to `pending` with its worktree and session kept, and no run
+# starts for this long. Then the parked brief is tried again and resumes
+# where it stopped; still limited, it waits this long again. /resume in
+# Telegram tries now.
+usage_limit_retry_minutes: 60
 
 # Multi-agent swarm settings
 # How many fix-and-revalidate rounds (QA bugs + reviewer issues) the

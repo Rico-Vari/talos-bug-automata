@@ -73,6 +73,46 @@ def is_paused() -> bool:
     return Path(PAUSED_FILE).expanduser().exists()
 
 
+# ── Claude usage limit ───────────────────────────────────────────────────────
+# A run that hits the Claude usage limit parks its brief and writes this
+# marker with the time of the next attempt. Until then dispatch starts no
+# run; reaping, the reconciler and admission go on. Unlike PAUSED it lifts
+# itself: the first pass after that time tries the parked brief again.
+USAGE_LIMIT_FILE = "~/.orchestrator/USAGE_LIMIT"
+
+
+def usage_limit_until() -> datetime | None:
+    """When the next run may start, or None if no usage-limit wait is active.
+
+    An expired or unreadable marker counts as no wait: a corrupt file must
+    not block every run forever.
+    """
+    path = Path(USAGE_LIMIT_FILE).expanduser()
+    try:
+        until = parse_iso(path.read_text().strip())
+    except OSError:
+        return None
+    if until is None or until <= datetime.now(timezone.utc):
+        return None
+    return until
+
+
+def set_usage_limit(until: datetime) -> None:
+    path = Path(USAGE_LIMIT_FILE).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(until.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
+
+
+def clear_usage_limit() -> bool:
+    """Removes the marker. True if there was one."""
+    path = Path(USAGE_LIMIT_FILE).expanduser()
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
 # ── Run window ───────────────────────────────────────────────────────────────
 # Optional `run_window:` block in config.yaml. Outside it, dispatch starts no
 # Claude run (same per-brief check as PAUSED); reaping, the reconciler and
