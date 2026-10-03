@@ -67,7 +67,7 @@ Four processes, all Python, all running from one checkout:
 | `bmad_kit.py` | Detects, installs (pinned `bmad-method`) and syncs the headless overrides |
 | `sentry_api.py` | Fetches the Sentry issue and latest event over REST at dispatch time |
 | `secrets_env.py` | Loads `~/.orchestrator/secrets.env` and resolves secret names from config |
-| `util.py` | Config path (`TALOS_CONFIG`), pause sentinel, slugs, time helpers |
+| `util.py` | Config path (`TALOS_CONFIG`), pause sentinel, run window, slugs, time helpers |
 | `bot.py` | Telegram commands and the `/brief` conversation |
 | `prompts/` | System prompts: `lead-orchestrator.md` (manual briefs), `lead-issue-fix.md`, `lead-review-fix.md` |
 | `bmad-kit/` | `_bmad/custom/` overrides: `bmad-quick-dev.toml`, `bmad-code-review.toml`, `headless-contract.md`, `headless-complete.md` |

@@ -34,7 +34,8 @@ from talos import bmad_kit
 from talos import worktree
 from talos import secrets_env
 from talos.routing import resolve_gh_repo, resolve_sentry_project, validate_routing
-from talos.util import CONFIG_PATH, is_paused, slugify, utcnow
+from talos.util import (CONFIG_PATH, in_run_window, is_paused, local_now, parse_run_window,
+                        slugify, utcnow)
 
 # ── Module constants (also imported by bot.py) ───────────────────────────────
 
@@ -226,6 +227,17 @@ def load_config() -> dict:
         # already copied.
         logger.warning("config.yaml: stall_timeout_seconds=%r is not an integer >= 0; using 1200", stall)
         cfg["stall_timeout_seconds"] = 1200
+
+    # Parsed once here so a bad window fails at startup, not at the first
+    # brief. The underscore marks it as derived, not a config.yaml key.
+    # `run_window:` with every child commented out loads as None; failing
+    # beats silently running at any hour.
+    if "run_window" in cfg and cfg["run_window"] is None:
+        raise SystemExit("config.yaml: run_window is empty; set start/end or remove the key")
+    try:
+        cfg["_run_window"] = parse_run_window(cfg.get("run_window"))
+    except ValueError as e:
+        raise SystemExit(f"config.yaml: {e}") from None
 
     # A badly written routing config has to fail here, not six hours
     # later when the first webhook arrives.
@@ -2158,11 +2170,13 @@ def reap_running_briefs(config: dict) -> None:
                 logger.warning("Could not mark the orphaned event %s: %s", event_id, e)
 
 
-def run_once(config: dict, dry_run: bool = False) -> int:
+def run_once(config: dict, dry_run: bool = False, ignore_schedule: bool = False) -> int:
     """
     Full pipeline: find pending, sort, process.
     Returns the number of briefs processed (0 if locked by another pass in
     progress).
+
+    `ignore_schedule` lets this pass start runs outside `run_window`.
     """
     if dry_run:
         briefs = sort_by_priority(
@@ -2198,11 +2212,11 @@ def run_once(config: dict, dry_run: bool = False) -> int:
         results: list[dict] = []
         seen: set[Path] = set()
         processed = 0
-        paused = False
+        halted = False  # PAUSED or outside the run window
         # Rescan when the batch ends: stage A enqueues review-fix round 1
         # (and the webhook keeps admitting) during the pass, and webhookd
         # cannot kick a pass that already holds the lock.
-        while not paused:
+        while not halted:
             briefs = [
                 b for b in sort_by_priority(
                     find_pending_briefs(config["vault"], config["briefs_dir"])
@@ -2220,7 +2234,18 @@ def run_once(config: dict, dry_run: bool = False) -> int:
                 if is_paused():
                     logger.warning("PAUSED appeared mid-pass — not starting "
                                    "%s or the ones after it", b.path.name)
-                    paused = True
+                    halted = True
+                    break
+                # Same spot and same reason as PAUSED: a pass that crosses
+                # the end of the window stops starting runs. The briefs stay
+                # `pending` for the first pass after the window opens; a run
+                # already going is left to finish.
+                window = config.get("_run_window")
+                if not ignore_schedule and not in_run_window(window):
+                    logger.info("Outside the run window (%s, now %s) — not starting "
+                                "%s or the ones after it", window.describe(),
+                                local_now(window).strftime("%H:%M"), b.path.name)
+                    halted = True
                     break
                 verdict = cap_verdict(config, b)
                 if not verdict.admitted:
@@ -2234,12 +2259,12 @@ def run_once(config: dict, dry_run: bool = False) -> int:
         return processed
 
 
-def watch_loop(config: dict) -> None:
+def watch_loop(config: dict, ignore_schedule: bool = False) -> None:
     interval = int(config.get("poll_interval_seconds", 300))
     logger.info("Watch mode started, polling every %ds", interval)
     try:
         while True:
-            run_once(config, dry_run=False)
+            run_once(config, dry_run=False, ignore_schedule=ignore_schedule)
             time.sleep(interval)
     except KeyboardInterrupt:
         logger.info("Watch mode stopped by the user.")
@@ -2258,6 +2283,8 @@ def main() -> None:
                         help="Show what it would do without invoking Docker or moving files.")
     parser.add_argument("--once", action="store_true",
                         help="Single pass (default).")
+    parser.add_argument("--ignore-schedule", action="store_true",
+                        help="Start runs even outside run_window (config.yaml).")
     args = parser.parse_args()
 
     setup_logging()
@@ -2265,9 +2292,9 @@ def main() -> None:
     check_prereqs(config, dry_run=args.dry_run)
 
     if args.watch:
-        watch_loop(config)
+        watch_loop(config, ignore_schedule=args.ignore_schedule)
     else:
-        run_once(config, dry_run=args.dry_run)
+        run_once(config, dry_run=args.dry_run, ignore_schedule=args.ignore_schedule)
 
 
 if __name__ == "__main__":

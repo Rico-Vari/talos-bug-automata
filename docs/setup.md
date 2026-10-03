@@ -99,11 +99,35 @@ The main keys:
 | `stall_timeout_seconds` | Cut a run whose log has not grown for this long (default 1200, `0` disables) |
 | `max_iterations` | Fix-and-revalidate rounds the swarm architect may run before it aborts a manual brief |
 | `projects` | Allowlist of local project paths, `name: path` |
+| `run_window` | Optional hours when Claude runs may start. See [Run window](#run-window) |
 | `repos`, `sentry`, `webhook`, `secrets`, `timeouts`, `global_daily_cap`, `reconcile_interval_minutes` | Event harness. See [event-harness.md](event-harness.md) |
 
 `config.yaml` holds names of environment variables, never secret values.
 Secrets go in `~/.orchestrator/secrets.env`. See
 [security-model.md](security-model.md#secrets).
+
+### Run window
+
+By default runs start at any hour. To limit them to a schedule:
+
+```yaml
+run_window:
+  timezone: America/Cancun   # IANA name; empty = the system's local time
+  start: "19:00"             # inclusive
+  end: "06:00"               # exclusive; start > end crosses midnight
+```
+
+Outside the window a dispatch pass still reaps and runs the reconciler, and
+webhookd keeps admitting, but no new Claude run starts: the briefs wait in
+`pending` for the first pass after the window opens. The check runs before
+each brief, like `/pause`, so a run already going when the window closes is
+left to finish. `/run` from the bot respects the window too. To start runs
+outside it, run `talos-dispatch --ignore-schedule`.
+
+A malformed block (unknown timezone or key, a time like `25:00` or a bare
+`19`, `start` equal to `end`, an empty `run_window:`) stops `talos-dispatch`
+and `talos-bot` at startup. `talos-webhookd` and `talos-reconcile` don't read
+the window, so they start anyway.
 
 ### Add a project
 
@@ -202,6 +226,7 @@ talos-dispatch              # single pass (same as --once)
 talos-dispatch --once       # single pass; what the systemd timer runs
 talos-dispatch --watch      # loop: a pass every poll_interval_seconds
 talos-dispatch --dry-run    # preview without Docker or file changes
+talos-dispatch --ignore-schedule  # start runs even outside run_window
 talos-bot                   # Telegram bot
 talos-webhookd              # webhook ingress on 127.0.0.1:8787
 talos-reconcile --dry-run   # what the reconciler would admit
