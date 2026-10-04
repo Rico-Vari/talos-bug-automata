@@ -41,17 +41,21 @@ usage_limit_retry_minutes: 60
 # converge; lower it if you want the system to escalate to a human sooner.
 max_iterations: 3
 
-# Run window: Claude runs start only inside it. Outside it, dispatch starts
-# no new run (like /pause), but the reconciler and webhookd keep admitting
-# and the briefs wait in `pending` until the window opens. A run already
-# going when the window closes is left to finish. `start` is inclusive, `end`
-# exclusive; start > end crosses midnight. `timezone` is an IANA name; leave
-# it empty to use the system's local time. Quote the times. Remove the block
-# to run at any hour. `talos-dispatch --ignore-schedule` bypasses it.
+# Run window: new work starts only inside it. Outside it, dispatch starts
+# no new stage A run (like /pause), but the reconciler and webhookd keep
+# admitting and the briefs wait in `pending` until the window opens. A run
+# already going when the window closes is left to finish. With
+# `finish_open_work: true` (the default), work that finishes a cycle already
+# started runs at any hour: a run parked by the usage limit resumes, and a
+# PR's review-fix rounds go. `start` is inclusive, `end` exclusive; start >
+# end crosses midnight. `timezone` is an IANA name; leave it empty to use the
+# system's local time. Quote the times. Remove the block to run at any hour.
+# `talos-dispatch --ignore-schedule` bypasses it.
 # run_window:
 #   timezone: America/Cancun
 #   start: "19:00"
 #   end: "06:00"
+#   finish_open_work: true
 
 # Local project folders: the allowlist of paths the agent may work in.
 # A project can be a single repo, or a parent folder holding several repos.
