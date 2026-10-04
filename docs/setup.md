@@ -117,14 +117,27 @@ run_window:
   timezone: America/Cancun   # IANA name; empty = the system's local time
   start: "19:00"             # inclusive
   end: "06:00"               # exclusive; start > end crosses midnight
+  finish_open_work: true     # default; false = nothing runs outside the window
 ```
 
 Outside the window a dispatch pass still reaps and runs the reconciler, and
-webhookd keeps admitting, but no new Claude run starts: the briefs wait in
+webhookd keeps admitting, but no new stage A run starts: those briefs wait in
 `pending` for the first pass after the window opens. The check runs before
 each brief, like `/pause`, so a run already going when the window closes is
 left to finish. `/run` from the bot respects the window too. To start runs
 outside it, run `talos-dispatch --ignore-schedule`.
+
+With `finish_open_work` on (the default), work that finishes a cycle already
+started runs at any hour:
+
+- a run parked by the Claude usage limit resumes when the limit resets, even
+  after the window closed;
+- a PR's review-fix rounds run, including the ones that human review
+  comments start during the day.
+
+Within a pass, parked resumes go first, then review-fix rounds, then new
+work by priority. The pass looks for new briefs after every run, so a round
+that stage A enqueues runs before the next stage A brief.
 
 A malformed block (unknown timezone or key, a time like `25:00` or a bare
 `19`, `start` equal to `end`, an empty `run_window:`) stops `talos-dispatch`

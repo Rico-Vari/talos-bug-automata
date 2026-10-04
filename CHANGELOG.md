@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `run_window.finish_open_work` (default `true`): outside the run window,
+  parked usage-limit resumes and review-fix rounds still run, so a PR cycle
+  cut by the limit or by the window's end completes. Only new stage A work
+  waits for the window.
+
 - A run that hits the Claude usage limit is parked instead of failed: its
   brief goes back to `pending`, no run starts for `usage_limit_retry_minutes`
   (default 60), and the retry resumes the same Claude session in the same
@@ -25,6 +30,11 @@ All notable changes to this project are documented here. The format follows
   the throwaway home.
 
 ### Changed
+
+- Dispatch looks for new briefs after every run instead of after every
+  batch, and runs review-fix rounds before new stage A briefs. A round that
+  stage A enqueued mid-pass used to wait behind the rest of the batch and was
+  lost when the pass stopped on the usage limit or the window's end.
 
 - The Telegram token moves to `secrets.env` (`secrets.telegram_bot_token_env`,
   default `TELEGRAM_BOT_TOKEN`). A literal `telegram_bot_token` in

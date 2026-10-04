@@ -481,6 +481,10 @@ def test_run_window_parsing() -> None:
     unquoted = parse_run_window(yaml.safe_load("start: 19:00\nend: 06:00\ntimezone: America/Cancun"))
     check("unquoted YAML times parse",
           (unquoted.start.hour, unquoted.end.hour) == (19, 6), str(unquoted))
+    check("finish_open_work defaults to on", cancun.finish_open_work is True)
+    check("finish_open_work: false turns it off",
+          parse_run_window({"start": "19:00", "end": "06:00",
+                            "finish_open_work": False}).finish_open_work is False)
 
     for bad in ({"start": "19:00", "end": "06:00", "timezone": "Mars/Base"},
                 {"start": "25:00", "end": "06:00"},
@@ -492,6 +496,7 @@ def test_run_window_parsing() -> None:
                 {"start": "19:00", "end": "06:00", "tz": "America/Cancun"},
                 {"start": "19:00", "end": "06:00", "timezone": 0},
                 {"start": "19:00", "end": "06:00", "timezone": "America"},
+                {"start": "19:00", "end": "06:00", "finish_open_work": "no"},
                 ["19:00", "06:00"]):
         try:
             parse_run_window(bad)
@@ -545,6 +550,73 @@ def test_run_window_stops_runs_not_reconciler() -> None:
         check("--ignore-schedule runs them anyway", len(calls) == 2, str(calls))
         calls, _ = run([night, afternoon])
         check("a window that closes mid-pass stops the ones that follow", len(calls) == 1, str(calls))
+
+
+def test_run_window_lets_open_work_finish() -> None:
+    """Outside the window, parked resumes and review-fix rounds still run; new stage A waits."""
+    print("\nD3d — run_window lets open work finish, review-fix goes first")
+    from datetime import datetime, timezone
+
+    from talos import dispatch
+    from talos.util import parse_run_window
+
+    with Sandbox() as sb:
+        todos = sb.vault / "ToDos"
+        _write_brief(todos / "a-new.md", {"project": "sandbox", "status": "pending",
+                                          "priority": "high"})
+        _write_brief(todos / "b-round.md", {"project": "sandbox", "status": "pending",
+                                            "pipeline": "review-fix", "priority": "high"})
+        _write_brief(todos / "c-parked.md", {"project": "sandbox", "status": "pending",
+                                             "pipeline": "issue-fix", "priority": "low",
+                                             "resume_run_id": "r-1", "resume_session_id": "s-1"})
+        afternoon = datetime(2026, 10, 3, 20, 0, tzinfo=timezone.utc)  # 15:00 Cancun
+        night = datetime(2026, 10, 4, 3, 0, tzinfo=timezone.utc)       # 22:00 Cancun
+
+        def run(clock: datetime, finish: bool = True, on_run=None) -> list:
+            calls = []
+            cfg = sb.cfg()
+            cfg["_run_window"] = parse_run_window(
+                {"timezone": "America/Cancun", "start": "19:00", "end": "06:00",
+                 "finish_open_work": finish})
+            real = dispatch.in_run_window
+
+            def fake_process(b, c, dry_run):
+                calls.append(b.path.name)
+                if on_run:
+                    on_run(b)
+
+            with patched(dispatch, "is_paused", lambda: False), \
+                 patched(dispatch, "in_run_window", lambda w: real(w, clock)), \
+                 patched(dispatch, "run_reconciler", lambda c: None), \
+                 patched(dispatch, "process_brief", fake_process), \
+                 patched(dispatch, "LOCK_FILE", sb.root / "dispatch.lock"):
+                dispatch.run_once(cfg)
+            return calls
+
+        calls = run(afternoon)
+        check("outside the window the parked resume and the review-fix round run, in that order",
+              calls == ["c-parked.md", "b-round.md"], str(calls))
+        calls = run(afternoon, finish=False)
+        check("with finish_open_work: false nothing runs", calls == [], str(calls))
+        calls = run(night)
+        check("inside the window: parked, then review-fix, then new work",
+              calls == ["c-parked.md", "b-round.md", "a-new.md"], str(calls))
+
+        # Stage A enqueues round 1 while the pass is going: the round runs
+        # before the next stage A brief, not after the batch.
+        for name in ("b-round.md", "c-parked.md"):
+            (todos / name).unlink()
+        _write_brief(todos / "d-new.md", {"project": "sandbox", "status": "pending",
+                                          "priority": "medium"})
+
+        def enqueue_round(b) -> None:
+            if b.path.name == "a-new.md":
+                _write_brief(todos / "e-round.md", {"project": "sandbox", "status": "pending",
+                                                    "pipeline": "review-fix", "priority": "high"})
+
+        calls = run(night, on_run=enqueue_round)
+        check("a round enqueued mid-pass runs before the next stage A brief",
+              calls == ["a-new.md", "e-round.md", "d-new.md"], str(calls))
 
 
 def test_hardened_home_is_disposable() -> None:
@@ -3149,6 +3221,7 @@ def main() -> int:
         test_pause_stops_dispatch_not_admission,
         test_run_window_parsing,
         test_run_window_stops_runs_not_reconciler,
+        test_run_window_lets_open_work_finish,
         test_hardened_home_is_disposable,
         test_sentry_event_alert,
         test_dry_run_rows_come_back_live,

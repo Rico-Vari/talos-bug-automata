@@ -2503,6 +2503,34 @@ def reap_running_briefs(config: dict) -> None:
                 logger.warning("Could not mark the orphaned event %s: %s", event_id, e)
 
 
+def is_parked(brief: Brief) -> bool:
+    """A run parked by the usage limit, waiting to resume its session."""
+    return bool(brief.metadata.get("resume_run_id") or brief.metadata.get("resume_session_id"))
+
+
+def is_review_fix(brief: Brief) -> bool:
+    return str(brief.metadata.get("pipeline") or "").strip().lower() == "review-fix"
+
+
+def finishes_open_work(brief: Brief) -> bool:
+    """Work that finishes a run already started: a parked run's resume, or a
+    review-fix round on a PR that is open. The run window lets it through
+    (`run_window.finish_open_work`), so a cycle cut by the usage limit or by
+    the window's end completes before new stage A work starts."""
+    return is_parked(brief) or is_review_fix(brief)
+
+
+def queue_order(briefs: list[Brief]) -> list[Brief]:
+    """Parked resumes first, then review-fix rounds, then priority.
+
+    A parked brief is the hourly check of whether the limit reset, and its
+    kept worktree must not wait behind fresh runs. A review-fix round is a
+    cheap step on a PR that is already open: it goes before new stage A work.
+    """
+    return sorted(sort_by_priority(briefs),
+                  key=lambda b: (not is_parked(b), not is_review_fix(b)))
+
+
 def run_once(config: dict, dry_run: bool = False, ignore_schedule: bool = False) -> int:
     """
     Full pipeline: find pending, sort, process.
@@ -2546,68 +2574,65 @@ def run_once(config: dict, dry_run: bool = False, ignore_schedule: bool = False)
         results: list[dict] = []
         seen: set[Path] = set()
         processed = 0
-        halted = False  # PAUSED or outside the run window
-        # Rescan when the batch ends: stage A enqueues review-fix round 1
-        # (and the webhook keeps admitting) during the pass, and webhookd
-        # cannot kick a pass that already holds the lock.
-        while not halted:
-            # A brief parked by the usage limit goes first: it is the
-            # hourly check of whether the limit reset, and its kept
-            # worktree must not wait behind fresh runs.
-            briefs = sorted(
-                (b for b in sort_by_priority(
-                    find_pending_briefs(config["vault"], config["briefs_dir"])
-                ) if b.path not in seen),
-                key=lambda b: not b.metadata.get("resume_run_id")
-                and not b.metadata.get("resume_session_id"),
-            )
-            if not briefs:
+        queue: list[Brief] | None = None
+        while True:
+            # Rescan after every run, not once per batch: stage A enqueues
+            # review-fix round 1 (and webhookd keeps admitting) during the
+            # pass, and webhookd cannot kick a pass that already holds the
+            # lock. A round waiting behind the rest of a batch was lost
+            # whenever the pass halted first.
+            if queue is None:
+                queue = queue_order(find_pending_briefs(config["vault"], config["briefs_dir"]))
+                if processed == 0 and queue:
+                    logger.info("Found %d pending brief(s)", len(queue))
+            queue = [b for b in queue if b.path not in seen]
+            if not queue:
                 break
-            logger.info("Found %d pending brief(s)", len(briefs))
-            for b in briefs:
-                seen.add(b.path)
-                # Before EACH brief, not only at startup: each run lasts up to
-                # two hours, and a /pause mid-pass has to stop the remaining
-                # ones, not wait for the queue to drain.
-                if is_paused():
-                    logger.warning("PAUSED appeared mid-pass — not starting "
-                                   "%s or the ones after it", b.path.name)
-                    halted = True
-                    break
-                # Same spot and same reason as PAUSED: a pass that crosses
-                # the end of the window stops starting runs. The briefs stay
-                # `pending` for the first pass after the window opens; a run
-                # already going is left to finish.
-                window = config.get("_run_window")
-                if not ignore_schedule and not in_run_window(window):
+            # Before EACH brief, not only at startup: each run lasts up to
+            # two hours, and a /pause mid-pass has to stop the remaining
+            # ones, not wait for the queue to drain.
+            if is_paused():
+                logger.warning("PAUSED appeared mid-pass — not starting "
+                               "%s or the ones after it", queue[0].path.name)
+                break
+            # Same spot and same reason as PAUSED: a pass that crosses the
+            # end of the window stops starting new work. The briefs stay
+            # `pending` for the first pass after the window opens; a run
+            # already going is left to finish. Work that finishes a PR
+            # already open still goes, unless `finish_open_work: false`.
+            window = config.get("_run_window")
+            if not ignore_schedule and not in_run_window(window):
+                waiting = len(queue)
+                queue = ([b for b in queue if finishes_open_work(b)]
+                         if window.finish_open_work else [])
+                if not queue:
                     logger.info("Outside the run window (%s, now %s) — not starting "
-                                "%s or the ones after it", window.describe(),
-                                local_now(window).strftime("%H:%M"), b.path.name)
-                    halted = True
+                                "new work (%d brief(s) wait)", window.describe(),
+                                local_now(window).strftime("%H:%M"), waiting)
                     break
-                # A run already hit the Claude usage limit: starting more
-                # only fails them. The marker lifts itself.
-                until = usage_limit_until()
-                if until is not None:
-                    logger.info("Claude usage limit: next try at %s — not starting "
-                                "%s or the ones after it",
-                                until.astimezone().strftime("%H:%M"), b.path.name)
-                    halted = True
+            # A run already hit the Claude usage limit: starting more
+            # only fails them. The marker lifts itself.
+            until = usage_limit_until()
+            if until is not None:
+                logger.info("Claude usage limit: next try at %s — not starting "
+                            "%s or the ones after it",
+                            until.astimezone().strftime("%H:%M"), queue[0].path.name)
+                break
+            b = queue[0]
+            seen.add(b.path)
+            # A parked brief already passed the caps when it first ran,
+            # and its own open PR must not count against its resume.
+            verdict = None if is_parked(b) else cap_verdict(config, b)
+            if verdict is not None and not verdict.admitted:
+                defer_brief(config, b, verdict)
+                continue
+            res = process_brief(b, config, dry_run=False)
+            processed += 1
+            queue = None
+            if res is not None:
+                results.append(res)
+                if res.get("status") == "usage_limit":
                     break
-                # A parked brief already passed the caps when it first ran,
-                # and its own open PR must not count against its resume.
-                parked = b.metadata.get("resume_run_id") or b.metadata.get("resume_session_id")
-                verdict = None if parked else cap_verdict(config, b)
-                if verdict is not None and not verdict.admitted:
-                    defer_brief(config, b, verdict)
-                    continue
-                res = process_brief(b, config, dry_run=False)
-                processed += 1
-                if res is not None:
-                    results.append(res)
-                    if res.get("status") == "usage_limit":
-                        halted = True
-                        break
         log_pass_summary(results)
         return processed
 

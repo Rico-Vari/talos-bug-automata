@@ -115,8 +115,10 @@ def clear_usage_limit() -> bool:
 
 # ── Run window ───────────────────────────────────────────────────────────────
 # Optional `run_window:` block in config.yaml. Outside it, dispatch starts no
-# Claude run (same per-brief check as PAUSED); reaping, the reconciler and
+# new work (same per-brief check as PAUSED); reaping, the reconciler and
 # admission go on, and the briefs wait in `pending` until the window opens.
+# With `finish_open_work` (the default), work that finishes a run already
+# started still goes: a parked run's resume and a PR's review-fix round.
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,7 @@ class RunWindow:
     start: dt_time          # inclusive
     end: dt_time            # exclusive; start > end crosses midnight
     tz: ZoneInfo | None     # None = the system's local time
+    finish_open_work: bool = True  # resumes and review-fix rounds ignore the window
 
     def describe(self) -> str:
         zone = self.tz.key if self.tz else "system local time"
@@ -164,7 +167,7 @@ def parse_run_window(raw) -> RunWindow | None:
         raise ValueError(f"run_window must be a mapping, got {type(raw).__name__}")
     # A misspelled `timezone` would otherwise fall back to the system's
     # local time and shift the window without a word.
-    unknown = set(raw) - {"start", "end", "timezone"}
+    unknown = set(raw) - {"start", "end", "timezone", "finish_open_work"}
     if unknown:
         raise ValueError(f"run_window has unknown key(s): {', '.join(sorted(map(str, unknown)))}")
     for field in ("start", "end"):
@@ -185,7 +188,10 @@ def parse_run_window(raw) -> RunWindow | None:
             tz = ZoneInfo(tz_name)
         except (ZoneInfoNotFoundError, ValueError, OSError):
             raise ValueError(f"run_window.timezone={tz_name!r} is not a known IANA timezone") from None
-    return RunWindow(start=start, end=end, tz=tz)
+    finish = raw.get("finish_open_work", True)
+    if not isinstance(finish, bool):
+        raise ValueError(f"run_window.finish_open_work={finish!r} is not true or false")
+    return RunWindow(start=start, end=end, tz=tz, finish_open_work=finish)
 
 
 def local_now(window: RunWindow, now: datetime | None = None) -> datetime:
